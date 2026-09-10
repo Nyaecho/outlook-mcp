@@ -192,22 +192,43 @@ async def test_search_property_restriction_discriminates(real_graph_client):
 async def test_search_quote_injection_cannot_neutralize(real_graph_client, sample):
     """An embedded quote makes Graph silently discard $search entirely.
 
-    That returns 200 and the whole mailbox — the reason `"` stays stripped. The
-    hostile query must stay bounded by the narrow one it is built from.
+    That returns 200 and the whole mailbox — the reason `"` stays stripped.
+
+    The assertion is equivalence, not a threshold. `term" OR "<nonsense>` sanitizes
+    to the free-text search `"term OR <nonsense>"`, and the nonsense half matches
+    nothing, so a working sanitizer makes the hostile query return *exactly* what
+    the benign free-text search for `term` returns. If the quote survived, Graph
+    would drop `$search` and answer with the mailbox instead, and the two counts
+    would part company.
+
+    An earlier version of this compared the hostile count against a `subject:term`
+    baseline times three. Those are different searches — one is property-restricted,
+    the other spans the body — so the bound held or broke on nothing more than
+    whether the harvested term happened to be rare in message bodies. It broke on
+    2026-09-10 with a perfectly intact sanitizer: subject:detected matched 1,
+    free-text `detected` matched 26.
     """
     if not sample["subject_term"]:
         pytest.skip("No suitable subject term to search for")
     term = sample["subject_term"]
-    narrow = await search_mail(
-        real_graph_client.sdk_client, query=f"subject:{term}", count=25
-    )
+
+    benign = await search_mail(real_graph_client.sdk_client, query=term, count=100)
     hostile = await search_mail(
-        real_graph_client.sdk_client, query=f'{term}" OR "zzqqxxnomatchzzqqxx', count=25
+        real_graph_client.sdk_client, query=f'{term}" OR "zzqqxxnomatchzzqqxx', count=100
     )
-    # If sanitization regresses, `hostile` becomes an unfiltered mailbox dump.
-    assert hostile["count"] <= max(narrow["count"] * 3, 10), (
-        "quote injection appears to have neutralized $search — "
-        f"narrow={narrow['count']} hostile={hostile['count']}"
+    nonsense = await search_mail(
+        real_graph_client.sdk_client, query="zzqqxxnomatchzzqqxx", count=100
+    )
+
+    # The injected half contributes nothing on its own — so if $search is still
+    # being applied, it contributes nothing inside the hostile query either.
+    assert nonsense["count"] == 0, (
+        "the nonsense term matched something, so it cannot serve as an inert "
+        f"injection payload — got {nonsense['count']}"
+    )
+    assert hostile["count"] == benign["count"], (
+        "quote injection changed the result set, which means $search was not "
+        f"applied as written — benign={benign['count']} hostile={hostile['count']}"
     )
 
 
