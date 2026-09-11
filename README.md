@@ -253,6 +253,13 @@ A one-time startup warning about the token cache falling back to plaintext means
 
 ## Tool Reference
 
+**Dates.** Every datetime parameter (`after`, `before`, `start`, `end`, `due`,
+`deferred_send_datetime`) accepts ISO 8601 — `2026-10-22` or `2026-10-22T14:30:00Z` — or a
+relative offset: `7d` is seven days **ago**, `+7d` is seven days **from now**, and `now` is
+this moment. Units are `m`, `h`, `d`, `w`. Bare means *ago*, matching the usual CLI
+convention, so a due date in the future needs the `+`. Zone-less input is interpreted in your
+configured `timezone`; responses are always UTC.
+
 ### Auth
 
 | Tool | Description |
@@ -347,12 +354,18 @@ A one-time startup warning about the token cache falling back to plaintext means
 
 ### Attachments
 
+> **Since 1.20.0, these tools only reach `attachments_dir`** (default `~/.outlook-mcp/attachments`).
+> A bare filename resolves inside it; a path outside it is refused, including via a symlink.
+> To email a file, move it there first — or widen `attachments_dir`, understanding that
+> anything reachable from it can be sent. Before 1.20.0 these tools could read any file the
+> server process could read, which meant an email asking an agent to attach one could be obeyed.
+
 | Tool | Description |
 |------|-------------|
 | `outlook_list_attachments` | List attachments on a message. |
-| `outlook_download_attachment` | Download attachment and save decoded bytes to a file. |
-| `outlook_send_with_attachments` | Send message with file attachments (auto upload session for >3MB). |
-| `outlook_attach_to_draft` | Add attachments to an existing draft (auto upload session for >3MB). |
+| `outlook_download_attachment` | Download an attachment and save decoded bytes into `attachments_dir`. |
+| `outlook_send_with_attachments` | Send a message with attachments read from `attachments_dir` (auto upload session for >3MB). |
+| `outlook_attach_to_draft` | Add attachments from `attachments_dir` to an existing draft (auto upload session for >3MB). |
 | `outlook_remove_draft_attachment` | Remove a single attachment from a draft. |
 
 ### Folder Management
@@ -381,6 +394,23 @@ A one-time startup warning about the token cache falling back to plaintext means
 | `outlook_get_mail_tips` | Pre-send check (OOF, delivery restrictions). |
 | `outlook_list_accounts` | List configured accounts. |
 | `outlook_switch_account` | Switch active account. |
+
+---
+
+## Prompts
+
+Three workflows ship as MCP prompts, so the common sequences do not have to be
+reconstructed call by call. Any MCP client that supports prompts will list them; in most
+clients they appear as slash commands or a prompt picker.
+
+| Prompt | Arguments | What it does |
+|--------|-----------|--------------|
+| `morning_brief` | `folder` (default `inbox`) | Today's events, unread mail and tasks due, in the cheapest order — one scan each, `concise=True`, batched reads. |
+| `triage_folder` | `folder` (default `inbox`), `count` (default 50) | One cheap scan of a folder, sorted into reply / archive / junk, applied with a single `outlook_batch_triage` call rather than one call per message. |
+| `catch_up` | `since` (default `24h`) | What changed in mail, calendar and contacts, via the delta path — roughly ten times cheaper than re-scanning on a schedule. |
+
+They cost nothing until invoked: `prompts/list` carries only a name and one line each, and
+the body is fetched on use.
 
 ---
 

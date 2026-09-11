@@ -57,6 +57,12 @@ Pass `concise=True` to read tools (`outlook_list_inbox`, `outlook_read_message`,
    ```
 6. **Restart the gateway:** `openclaw gateway restart`
 
+## Prompts (3)
+
+- `morning_brief(folder="inbox")` — today's events, unread mail and tasks due, in the cheapest order
+- `triage_folder(folder="inbox", count=50)` — one scan, sorted, applied in a single batch call
+- `catch_up(since="24h")` — what changed, via the delta path
+
 ## Tools (62)
 
 ### Auth
@@ -124,8 +130,8 @@ Pass `concise=True` to read tools (`outlook_list_inbox`, `outlook_read_message`,
 
 ### Attachments
 - `outlook_list_attachments` — List on a message
-- `outlook_download_attachment` — Download and save decoded bytes to a file
-- `outlook_send_with_attachments` — Send with files (auto upload session for >3MB)
+- `outlook_download_attachment` — Download and save decoded bytes into `attachments_dir`
+- `outlook_send_with_attachments` — Send with files read from `attachments_dir` (auto upload session for >3MB)
 - `outlook_attach_to_draft` — Add attachments to an existing draft (auto upload session for >3MB)
 - `outlook_remove_draft_attachment` — Remove a single attachment from a draft
 
