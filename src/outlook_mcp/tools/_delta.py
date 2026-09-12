@@ -19,18 +19,33 @@ Tokens are *not* persisted by outlook-mcp — that's the caller's job (an
 agent decides where it wants to store its watermark). We pass the raw
 ``@odata.deltaLink`` / ``@odata.nextLink`` URL through as the opaque
 cursor string.
+
+That last point is why ``require_graph_url`` exists: because the cursor
+lives outside this process and comes back in as a request URL carrying the
+mailbox bearer token, it is untrusted input, and every URL that would
+receive the token is checked against ``graph.microsoft.com`` first.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
+from outlook_mcp.errors import UntrustedURLError
 from outlook_mcp.throttle import send_with_retry
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0/"
 GRAPH_TOKEN_SCOPE = "https://graph.microsoft.com/.default"
+
+# The only host that may ever receive a Graph bearer token.
+GRAPH_HOST = "graph.microsoft.com"
+
+# Control characters and spaces: the set that different URL parsers disagree
+# about. A real Graph cursor contains none of them.
+_FORBIDDEN_URL_CHARS = re.compile(r"[\x00-\x20\x7f-\xa0]")
 
 # Safety cap multiplier — bound a single tool call to at most this many
 # items even when Graph keeps handing us more ``@odata.nextLink`` pages
@@ -43,6 +58,61 @@ def _bearer_token(credential: Any) -> str:
     """Mint a Graph access token from an azure-identity credential."""
     tok = credential.get_token(GRAPH_TOKEN_SCOPE)
     return tok.token
+
+
+def require_graph_url(url: str, *, source: str) -> str:
+    """Return ``url`` if it is an https Graph URL, else refuse.
+
+    Every URL this module requests carries the mailbox bearer token, and two of
+    them arrive from outside: the caller's ``delta_token`` and the
+    ``@odata.nextLink`` read back out of a response body. Neither is trustworthy
+    — an agent that reads mail can be told what cursor to use — so the host is
+    checked before the token is attached, not after.
+
+    Parsed, not string-matched, for the same reason
+    ``resolve_attachment_path`` resolves instead of comparing substrings: a
+    ``startswith`` test on the Graph prefix passes
+    ``https://graph.microsoft.com@evil.example/`` (whose real host is
+    ``evil.example``) and ``https://graph.microsoft.com.evil.example/``.
+
+    Parsing alone is not enough either, because parsers disagree. ``urlsplit``
+    deletes tab/CR/LF before parsing while an HTTP client does not, so the two
+    can read different hosts out of one string. The characters that cause the
+    disagreement are refused outright, and the comparison is against the whole
+    ``netloc`` rather than ``hostname`` so userinfo and an explicit port — the
+    other two classic sources of parser differentials — are refused with it.
+    Graph emits neither in a deltaLink.
+
+    ``source`` names where the URL came from so the refusal says which cursor to
+    throw away.
+    """
+    candidate = (url or "").strip()
+    if not candidate:
+        raise UntrustedURLError(source, url)
+
+    # ``urlsplit`` silently deletes tab, CR and LF before parsing, so
+    # ``https://evil.example\t@graph.microsoft.com/x`` reads as Graph here and
+    # as something else to an HTTP client. Rather than try to agree with every
+    # parser, refuse the characters that make them disagree.
+    if _FORBIDDEN_URL_CHARS.search(candidate):
+        raise UntrustedURLError(source, url)
+
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError as exc:
+        # A host urlsplit cannot parse is not a host we are willing to send a
+        # token to.
+        raise UntrustedURLError(source, url) from exc
+
+    # ``netloc``, not ``hostname``: equality also rules out userinfo and an
+    # explicit port, neither of which Graph puts in a deltaLink, and both of
+    # which are classic ways to make two parsers read different hosts.
+    if parsed.scheme.lower() != "https" or parsed.netloc.lower() != GRAPH_HOST:
+        raise UntrustedURLError(source, url)
+
+    # Return what was checked, not what was passed in — validating one string
+    # and sending another is how a check gets bypassed.
+    return candidate
 
 
 def format_delta_item(raw: dict, normal_formatter) -> dict:
@@ -107,7 +177,13 @@ async def fetch_delta_pages(
         page_size = 1
     cap = page_size * PAGE_SIZE_CAP_MULTIPLIER
 
-    url: str = delta_token if delta_token else initial_url
+    # Check the host before minting the token, so a poisoned cursor costs a
+    # refusal rather than a request.
+    url: str = (
+        require_graph_url(delta_token, source="delta_token")
+        if delta_token
+        else require_graph_url(initial_url, source="initial_url")
+    )
     base_headers = {
         "Authorization": f"Bearer {_bearer_token(credential)}",
         "Accept": "application/json",
@@ -138,12 +214,14 @@ async def fetch_delta_pages(
 
             if delta_link:
                 # Reached the end of this sync round. The deltaLink is the
-                # cursor for the *next* round.
-                next_token = delta_link
+                # cursor for the *next* round — validated before we return it so
+                # a poisoned link is never stored by the caller and replayed.
+                next_token = require_graph_url(delta_link, source="@odata.deltaLink")
                 has_more = False
                 break
 
             if next_link:
+                next_link = require_graph_url(next_link, source="@odata.nextLink")
                 if len(collected) >= cap:
                     # Hit the per-call cap mid-sync. Hand the nextLink back
                     # so the caller resumes from where we stopped.

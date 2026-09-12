@@ -14,7 +14,11 @@ from azure.identity import (
 )
 
 from outlook_mcp.config import DEFAULT_CONFIG_DIR, Config
-from outlook_mcp.errors import AuthRequiredError
+from outlook_mcp.errors import (
+    AuthRequiredError,
+    OutlookMCPError,
+    UnencryptedTokenCacheError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +57,30 @@ def _unencrypted_fallback_will_be_used() -> bool:
     Linux is at risk — and only when PyGObject/libsecret isn't
     importable in the current Python environment (the failure mode
     reported in #7 for `uv tool install`).
+
+    This is only half the condition. libsecret can be importable and still
+    unusable — no running Secret Service, as in a display-less SSH session or
+    a container — which azure-identity discovers lazily at first token use.
+    ``_is_azure_unencrypted_refusal`` below catches that half; a False here
+    does not mean an encrypted cache is guaranteed.
     """
     if sys.platform != "linux":
         return False
     return importlib.util.find_spec("gi") is None
+
+
+# azure-identity refuses to build a plaintext cache *lazily* — at first token
+# use, not at credential construction — and only when libsecret is importable
+# but unusable (a display-less SSH session, a container). The eager
+# find_spec("gi") check above cannot see that case, so this is the second half
+# of the same condition. Matched on azure's own wording from
+# azure/identity/_persistent_cache.py.
+_AZURE_UNENCRYPTED_MARKER = "allow_unencrypted_storage"
+
+
+def _is_azure_unencrypted_refusal(exc: BaseException) -> bool:
+    """True for azure-identity's "cache encryption is impossible" ValueError."""
+    return isinstance(exc, ValueError) and _AZURE_UNENCRYPTED_MARKER in str(exc)
 
 
 # The Graph SDK always requests .default scope internally, so we must
@@ -97,6 +121,11 @@ class AuthManager:
         self.credential: DeviceCodeCredential | None = None
         self._credentials: dict[str, DeviceCodeCredential] = {}
         self._active_account: str | None = config.default_account
+        # Set when startup authentication failed for a reason the operator has
+        # to fix in config rather than by running `outlook-mcp auth` — that
+        # advice would just fail the same way. Surfaced by get_credential() so
+        # the remedy reaches the agent on every tool call, not only stderr.
+        self.startup_error: OutlookMCPError | None = None
 
     def get_scopes(self) -> list[str]:
         """Return individual scopes for display/consent purposes."""
@@ -117,17 +146,24 @@ class AuthManager:
     ) -> DeviceCodeCredential:
         """Create a DeviceCodeCredential with persistent cache."""
         global _warned_unencrypted_fallback
+        opted_in = self.config.allow_unencrypted_token_cache
         cache_options = TokenCachePersistenceOptions(
             name=CACHE_NAME,
-            allow_unencrypted_storage=True,
+            allow_unencrypted_storage=opted_in,
         )
+        if _unencrypted_fallback_will_be_used() and not opted_in:
+            # Stop here rather than hand msal_extensions a credential it can
+            # only persist in cleartext. Silently doing it is what made
+            # SECURITY.md's "never in plain files" untrue.
+            raise UnencryptedTokenCacheError()
         if not _warned_unencrypted_fallback and _unencrypted_fallback_will_be_used():
             logger.warning(
-                "Token cache will be stored unencrypted on disk because "
+                "Token cache will be stored unencrypted on disk: "
+                "allow_unencrypted_token_cache is set and "
                 "PyGObject/libsecret is not importable in this Python "
                 "environment (common with `uv tool install` on Linux — "
                 "the tool's isolated venv can't see system PyGObject). "
-                "To enable encrypted caching via libsecret/gnome-keyring, "
+                "To get encrypted caching via libsecret/gnome-keyring, "
                 "install the system packages "
                 "(apt: `gnome-keyring libsecret-1-0 python3-gi`) and "
                 "re-create the venv with `--system-site-packages`. See "
@@ -171,7 +207,12 @@ class AuthManager:
         cred = self._make_credential(prompt_callback=_on_device_code)
         # get_token() uses cache first, falls back to interactive.
         # Must use .default scope to match what the Graph SDK requests.
-        cred.get_token(*self.get_token_scopes())
+        try:
+            cred.get_token(*self.get_token_scopes())
+        except ValueError as exc:
+            if _is_azure_unencrypted_refusal(exc):
+                raise UnencryptedTokenCacheError() from exc
+            raise
 
         # Save the auth record for silent refresh by the MCP server
         record = getattr(cred, "_auth_record", None)
@@ -199,6 +240,16 @@ class AuthManager:
             cred.get_token(*self.get_token_scopes())
             self.credential = cred
             return True
+        except UnencryptedTokenCacheError:
+            # Not a stale token — the environment cannot store one safely.
+            # Swallowing it here sends the operator round the `outlook-mcp auth`
+            # loop with no idea what to change.
+            raise
+        except ValueError as exc:
+            if _is_azure_unencrypted_refusal(exc):
+                raise UnencryptedTokenCacheError() from exc
+            logger.warning("Cached token refresh failed — re-run `outlook-mcp auth`.")
+            return False
         except Exception:
             logger.warning("Cached token refresh failed — re-run `outlook-mcp auth`.")
             return False
@@ -206,6 +257,8 @@ class AuthManager:
     def get_credential(self) -> DeviceCodeCredential:
         """Get the current credential, raising if not authenticated."""
         if self.credential is None:
+            if self.startup_error is not None:
+                raise self.startup_error
             raise AuthRequiredError()
         return self.credential
 
