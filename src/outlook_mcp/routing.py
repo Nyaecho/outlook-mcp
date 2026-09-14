@@ -16,6 +16,8 @@ each group onto a capability:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from outlook_mcp.toolsets import TOOL_GROUPS
 
 _GROUP_CAPABILITY: dict[str, str] = {
@@ -48,3 +50,28 @@ def capability_for(tool_name: str | None) -> str | None:
     if group is None or group == "account":
         return None
     return _GROUP_CAPABILITY.get(group)
+
+
+# outlook_changes_since runs its mail/events/contacts deltas against one
+# client, so it is only correct when all three route to the same account.
+COMPOSED_DIGEST_CAPABILITIES = ("mail", "calendar", "contacts")
+
+
+def composed_digest_conflict(routing: Mapping[str, str | None]) -> str | None:
+    """Error message when outlook_changes_since cannot serve its capabilities.
+
+    In a split setup the composed digest would silently return one account's
+    calendar under another's mail, so refuse and point at the per-capability
+    delta tools, which each route to their own account.
+    """
+    accounts = {routing.get(cap) for cap in COMPOSED_DIGEST_CAPABILITIES}
+    if len(accounts) > 1:
+        detail = ", ".join(f"{cap}->{routing.get(cap)}" for cap in COMPOSED_DIGEST_CAPABILITIES)
+        return (
+            "outlook_changes_since spans mail, calendar and contacts, which are "
+            f"routed to different accounts ({detail}); one call cannot serve "
+            "them all. Use outlook_list_inbox_delta, outlook_list_events_delta "
+            "and outlook_list_contacts_delta instead — each routes to its own "
+            "account."
+        )
+    return None

@@ -229,6 +229,41 @@ uv run outlook-mcp logout   # Clear credentials
 uv run outlook-mcp serve    # Start MCP server (default, used by OpenClaw/Claude)
 ```
 
+### Multiple accounts (per-capability routing)
+
+`accounts` was configuration scaffolding in earlier releases — listed, never used. It now routes **capabilities** to accounts, so one Microsoft identity per concern: mail on the account that receives notifications, To Do on the one that holds the task lists.
+
+```json
+{
+  "accounts": [
+    {"name": "net",  "client_id": "<same-or-per-account app id>"},
+    {"name": "neko", "client_id": "<app id>"}
+  ],
+  "default_account": "net",
+  "capability_accounts": {"mail": "net", "calendar": "net", "todo": "neko"},
+  "allow_cross_account": false
+}
+```
+
+Authenticate each account separately — the device-code flow signs in whatever identity the browser offers, so make sure you pick the right one:
+
+```bash
+uv run outlook-mcp auth net    # sign in as net's identity in the browser
+uv run outlook-mcp auth neko   # then as neko's
+uv run outlook-mcp status      # per-account status + the routing table
+```
+
+Each account gets its own token cache (`outlook-mcp-<name>`) and auth record. Single-account installs (top-level `client_id`, no `accounts`) behave exactly as before.
+
+**Routing**: every tool serves the account configured for its capability — mail-centric groups (mail, drafts, attachments, folders, admin) fold into `mail`; `calendar`, `contacts`, `todo` map 1:1; the delta tools split by name; identity tools (`outlook_whoami` & co.) follow the active account. `outlook_changes_since` spans three capabilities and refuses when they don't all route to the same account — use the individual delta tools then.
+
+**`allow_cross_account`** is the master switch for everything beyond the configured routing:
+
+- `false` (default): the agent sees **one merged account**. `outlook_switch_account` refuses (before validating any name, so refusals leak nothing), `outlook_list_accounts` collapses to the active identity, and no tool takes an account parameter — there is no path to another account's non-default content.
+- `true`: `outlook_switch_account("neko")` moves the active account; `outlook_switch_account("neko", capability="todo")` re-routes one capability. Configured routings still win over the active account — switching identity doesn't drag routed capabilities along.
+
+One caveat worth knowing: session-level switches (and only those) are lost when the server restarts.
+
 ---
 
 ## Troubleshooting

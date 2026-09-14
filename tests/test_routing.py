@@ -1,6 +1,10 @@
 """Tests for capability routing: tool name -> capability -> account."""
 
-from outlook_mcp.routing import capability_for
+from outlook_mcp.routing import (
+    COMPOSED_DIGEST_CAPABILITIES,
+    capability_for,
+    composed_digest_conflict,
+)
 from outlook_mcp.toolsets import TOOL_GROUPS
 
 # The mail-centric groups fold into "mail"; calendar/contacts/todo map 1:1;
@@ -58,3 +62,25 @@ class TestCapabilityFor:
                 assert capability_for(name) in {"mail", "calendar", "contacts"}, (
                     f"delta tool {name} has no capability override"
                 )
+
+
+class TestComposedDigestConflict:
+    """changes_since runs mail/events/contacts deltas against one client.
+
+    In a split setup it would silently return one account's calendar under
+    another's mail — the guard turns that into a refusal naming the fix.
+    """
+
+    def test_uniform_routing_is_fine(self):
+        assert (
+            composed_digest_conflict({"mail": "net", "calendar": "net", "contacts": "net"}) is None
+        )
+
+    def test_split_routing_refuses(self):
+        conflict = composed_digest_conflict({"mail": "net", "calendar": "net", "contacts": "neko"})
+        assert conflict is not None
+        assert "contacts->neko" in conflict
+        assert "outlook_list_contacts_delta" in conflict
+
+    def test_the_guard_covers_exactly_the_composed_capabilities(self):
+        assert set(COMPOSED_DIGEST_CAPABILITIES) == {"mail", "calendar", "contacts"}

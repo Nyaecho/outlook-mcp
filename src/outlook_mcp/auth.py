@@ -294,11 +294,20 @@ class AuthManager:
                 any_ok = True
 
         # The active account's credential — or, when it didn't authenticate,
-        # the first one that did, so identity tools still answer.
+        # the first one that did, so identity tools still answer. Say so:
+        # silently answering as a different account than the configured
+        # default is exactly the kind of surprise an operator needs in the log.
         if self.credential is None and self._credentials:
             fallback = next(iter(self._credentials))
-            if self._active_account not in self._credentials:
-                self._active_account = fallback
+            logger.warning(
+                "Active account '%s' has no valid token; identity and unrouted "
+                "capabilities will be served by '%s' instead. Run "
+                "`outlook-mcp auth %s` to fix.",
+                self._active_account,
+                fallback,
+                self._active_account,
+            )
+            self._active_account = fallback
             self.credential = self._credentials[fallback]
         return any_ok
 

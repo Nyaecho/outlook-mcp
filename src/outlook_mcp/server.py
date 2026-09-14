@@ -22,7 +22,11 @@ from outlook_mcp.errors import (
     wrap_graph_error,
 )
 from outlook_mcp.graph import GraphClient
-from outlook_mcp.routing import capability_for
+from outlook_mcp.routing import (
+    COMPOSED_DIGEST_CAPABILITIES,
+    capability_for,
+    composed_digest_conflict,
+)
 from outlook_mcp.tools import (
     admin,
     batch,
@@ -82,6 +86,9 @@ Working rules, each of which saves a round trip:
 - You are already signed in. Do not call outlook_whoami, outlook_list_accounts or
   outlook_auth_status to check before doing something — just call the tool you need. If a call
   does fail on authentication, its error says exactly what to run.
+- This install may merge several accounts by capability (mail, calendar, contacts and todo
+  each route to a configured account). whoami shows the active identity, which is not
+  necessarily the account behind every capability — that is the configured shape, not a bug.
 - Folder parameters take display names directly ("Junk Email", "Purchases"), as well as
   well-known names ("inbox", "drafts") and Graph IDs. Do not list folders first to find an ID.
   Call outlook_list_folders only when you genuinely need to discover what folders exist.
@@ -965,7 +972,18 @@ async def outlook_changes_since(
     Calendar `modified[]` is reserved for future use — modified events surface in `new[]`
     today (Graph delta doesn't distinguish them). Calendar `organizer_email` is also
     currently empty (the v1.9.0 delta formatter surfaces the organizer name only).
+
+    With per-capability account routing that splits mail/calendar/contacts across
+    accounts, this tool refuses — one call runs all three deltas against one
+    account. Use the individual delta tools, which each route correctly.
     """
+    auth = _get_auth(ctx)
+    if _get_config(ctx).accounts:
+        conflict = composed_digest_conflict(
+            {cap: auth.resolve_capability_account(cap) for cap in COMPOSED_DIGEST_CAPABILITIES}
+        )
+        if conflict:
+            raise ValueError(conflict)
     client = _get_graph_client(ctx)
     return await digest.changes_since(client, delta_tokens, fallback_window_hours)
 

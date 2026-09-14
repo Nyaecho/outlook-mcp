@@ -41,11 +41,11 @@ def cmd_auth(account: str | None = None) -> None:
     config = load_config()
     if config.accounts:
         account = account or config.default_account
-    elif account:
-        _resolve_account_arg(config, account)  # exits with an explanation
-    client_id = config.client_id if account is None else None
-    if account is not None:
-        client_id = next((a.client_id for a in config.accounts if a.name == account), None)
+    account = _resolve_account_arg(config, account)  # exits with an explanation
+    if account is None:
+        client_id = config.client_id
+    else:
+        client_id = next(a.client_id for a in config.accounts if a.name == account)
     if not client_id:
         print("Error: client_id not configured.")
         print("Set client_id in ~/.outlook-mcp/config.json")
