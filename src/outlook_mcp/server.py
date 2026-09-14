@@ -22,6 +22,7 @@ from outlook_mcp.errors import (
     wrap_graph_error,
 )
 from outlook_mcp.graph import GraphClient
+from outlook_mcp.routing import capability_for
 from outlook_mcp.tools import (
     admin,
     batch,
@@ -124,23 +125,49 @@ def _get_config(ctx: Context):
     return ctx.request_context.lifespan_context["config"]
 
 
-def _get_graph_client(ctx: Context) -> GraphClient:
-    """Return a Graph client, reused across tool calls for the same credential.
+def _calling_tool_name(ctx: Context) -> str | None:
+    """Name of the tool currently executing, when the SDK exposes it.
 
-    Building a ``GraphServiceClient`` (auth provider, request adapter, TLS
-    connection pool) on every tool call is wasteful on recurring agent loops.
-    Cache one in the lifespan context and reuse it while the credential is
-    unchanged. A ``switch_account`` / re-auth swaps ``AuthManager.credential``
-    for a different object, so an identity check rebuilds the client
-    automatically — no explicit invalidation needed.
+    Account routing reads this to pick the account for the call's capability,
+    so the 60-odd tool bodies never mention accounts themselves. Defensive
+    getattrs: tests drive tools with fake contexts that skip the plumbing.
+    """
+    rc = getattr(ctx, "request_context", None)
+    if rc is None:
+        return None
+    # mcp 2.x hands the inbound call's params as a plain dict
+    # ({name, arguments}) on ServerRequestContext, with `request` left None
+    # on this path; older layouts nested an object under request.params.
+    params = getattr(rc, "params", None)
+    if isinstance(params, dict):
+        name = params.get("name")
+        if isinstance(name, str):
+            return name
+    for holder in (params, getattr(rc, "request", None)):
+        name = getattr(getattr(holder, "params", None), "name", None)
+        if isinstance(name, str):
+            return name
+    return None
+
+
+def _get_graph_client(ctx: Context) -> GraphClient:
+    """Return a Graph client for the calling tool's account, cached per account.
+
+    Multi-account configs route capabilities (mail / calendar / contacts /
+    todo) to accounts: the calling tool's name decides the capability, the
+    AuthManager decides the account, and one GraphServiceClient is cached per
+    account in the lifespan context. Single-account installs route everything
+    to the one credential, exactly as before.
     """
     auth = _get_auth(ctx)
-    credential = auth.get_credential()  # raises AuthRequiredError if unauthenticated
+    account = auth.resolve_capability_account(capability_for(_calling_tool_name(ctx)))
+    credential = auth.get_account_credential(account)  # raises AuthRequiredError if unauthenticated
     lifespan_ctx = ctx.request_context.lifespan_context
-    cached = lifespan_ctx.get("graph_client")
+    clients: dict = lifespan_ctx.setdefault("graph_clients", {})
+    cached = clients.get(account)
     if cached is None or cached.credential is not credential:
         cached = GraphClient(credential)
-        lifespan_ctx["graph_client"] = cached
+        clients[account] = cached
     return cached
 
 
@@ -194,9 +221,7 @@ async def outlook_auth_status(ctx: Context) -> dict:
             # changing.
             result["action_required"] = str(auth.startup_error)
         else:
-            result["action_required"] = (
-                "Run `outlook-mcp auth` on the host to authenticate."
-            )
+            result["action_required"] = "Run `outlook-mcp auth` on the host to authenticate."
     return result
 
 
@@ -1472,10 +1497,17 @@ async def outlook_list_accounts(ctx: Context) -> dict:
 
 @mcp.tool()
 @_wrap_tool_errors
-async def outlook_switch_account(ctx: Context, name: str) -> dict:
-    """Switch the active Outlook account by configured `name` (from outlook_list_accounts)."""
+async def outlook_switch_account(ctx: Context, name: str, capability: str | None = None) -> dict:
+    """Switch the active Outlook account, or one capability's routing, by configured `name`.
+
+    Without `capability`, switches the active account (identity tools and any
+    unrouted capability). With `capability` ("mail", "calendar", "contacts",
+    "todo"), re-routes just that capability to `name`. Both forms require
+    `allow_cross_account: true` in config — otherwise the per-capability
+    routing is fixed and this tool refuses.
+    """
     auth = _get_auth(ctx)
-    return auth.switch_account(name)
+    return auth.switch_account(name, capability)
 
 
 # ── Annotations + config-gated toolsets ───────────────────────────────
