@@ -43,6 +43,7 @@ import pytest
 from outlook_mcp.tools.contacts import list_contacts, search_contacts
 from outlook_mcp.tools.mail_read import list_inbox, search_mail
 from outlook_mcp.tools.mail_thread import list_thread
+from outlook_mcp.tools.todo import get_task, list_tasks
 
 pytestmark = [pytest.mark.live, pytest.mark.asyncio]
 
@@ -327,3 +328,25 @@ async def test_contact_search_does_not_claim_to_know_categories(real_graph_clien
     found = await search_contacts(real_graph_client.sdk_client, query=term, count=25)
     assert found["contacts"], f"search for {term!r} returned nothing, though it names a contact"
     assert all("categories" not in c for c in found["contacts"])
+# ── todo: $expand=checklistItems on a single-task GET ──
+
+
+async def test_get_task_checklist_expand_is_accepted(real_graph_client):
+    """get_task's $expand=checklistItems must come back, not 400 and not silently empty.
+
+    The mock suite can only assert we write "checklistItems" into the query
+    configuration; only Graph decides whether the expansion is legal on this
+    endpoint and actually populates task.checklistItems.
+    """
+    page = await list_tasks(real_graph_client.sdk_client, count=5)
+    if not page["tasks"]:
+        pytest.skip("Default To Do list is empty — no task to expand")
+
+    detail = await get_task(real_graph_client.sdk_client, page["tasks"][0]["id"])
+
+    assert detail["id"] == page["tasks"][0]["id"]
+    assert isinstance(detail["checklist_items"], list)
+    # Unchecked-first ordering is part of the tool's contract: an agent reads
+    # the first unchecked item as "the next step".
+    flags = [item["is_checked"] for item in detail["checklist_items"]]
+    assert flags == sorted(flags), f"checked items sorted ahead of unchecked ones: {flags}"
