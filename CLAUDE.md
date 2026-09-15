@@ -78,7 +78,7 @@ Still manual by design: the live tier (run it *before* tagging) and ClawHub.
 - Anything taking a host filesystem path routes through `resolve_attachment_path`. Paths come
   from the model, and the model reads email — treat them as untrusted input, and confine by
   resolving, never by string comparison
-- Tool schemas are a per-turn cost with a measured baseline (~8,644 tokens for 62 tools).
+- Tool schemas are a per-turn cost with a measured baseline (~8,644 tokens for 62 tools (+3 aggregate tools on the feat/multi-account fork line)).
   Metadata that is correct but inert — `openWorldHint`, which is `true` by default anyway, or
   titles that restate the tool name — is not free. `test_tool_surface_budget.py` holds the line
 - Datetimes: UTC in responses, config timezone for input interpretation

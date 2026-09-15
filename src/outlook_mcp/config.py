@@ -98,6 +98,17 @@ class Config(BaseModel):
             "switch routing to query non-default content."
         ),
     )
+    allow_aggregate: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the aggregated read tools (outlook_list_inbox_all, "
+            "outlook_list_events_all, outlook_list_tasks_all). False (default): "
+            "they refuse. True: they fan out concurrently to every authenticated "
+            "account and return one merged, per-item account-tagged listing. "
+            "Orthogonal to allow_cross_account: cross gates deliberately "
+            "switching routing; aggregate gates bulk cross-account reads."
+        ),
+    )
 
     @field_validator("allow_categories")
     @classmethod
