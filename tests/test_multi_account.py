@@ -466,3 +466,80 @@ async def test_auth_status_names_the_active_account_when_unauthenticated():
 
     assert result["authenticated"] is False
     assert "outlook-mcp auth net" in result["action_required"]
+
+
+# ── 1.21 → multi-account upgrade keeps the login ────────────────────
+
+
+def test_legacy_login_is_adopted_for_default_account(tmp_path, monkeypatch, caplog):
+    """A 1.21 install with 'accounts' populated had ONE login (auth_record.json)
+    that served everything — the list did nothing. The upgrade must not
+    silently drop it: the legacy record becomes the default account's."""
+    record_dir = tmp_path / "records"
+    record_dir.mkdir()
+    (record_dir / "legacy.json").write_text("{}")
+    monkeypatch.setattr(
+        "outlook_mcp.auth._auth_record_path",
+        lambda account=None: (
+            record_dir / ("legacy.json" if account is None else f"record-{account}.json")
+        ),
+    )
+    records: dict = {None: object()}
+    monkeypatch.setattr(
+        "outlook_mcp.auth._load_auth_record", lambda account=None: records.get(account)
+    )
+    monkeypatch.setattr(
+        "outlook_mcp.auth._save_auth_record",
+        lambda record, account=None: records.__setitem__(account, record),
+    )
+
+    config = _two_account_config()
+    auth = AuthManager(config)
+
+    def fake_make(_self, account=None, prompt_callback=None, auth_record=None, *, silent=False):
+        cred = MagicMock()
+        cred.get_token = MagicMock(return_value=None)
+        return cred
+
+    monkeypatch.setattr(AuthManager, "_make_credential", fake_make)
+
+    with caplog.at_level("WARNING", logger="outlook_mcp.auth"):
+        assert auth.try_cached_token() is True
+
+    # The default account runs on yesterday's login, not on nothing. The other
+    # account legitimately starts unauthenticated — on 1.21 it had no login —
+    # and its tools fail closed with their own remedy.
+    assert "net" in auth._credentials
+    assert "neko" not in auth._credentials
+    assert auth.credential is auth._credentials["net"]
+    assert "Adopting it as 'net'" in caplog.text
+
+
+def test_no_adoption_when_the_default_account_has_its_own_record(tmp_path, monkeypatch, caplog):
+    """Per-account record present: the legacy file is left alone (and a fresh
+    multi-account install, with no legacy file at all, never adopts)."""
+    record_dir = tmp_path / "records"
+    record_dir.mkdir()
+    (record_dir / "legacy.json").write_text("{}")
+    (record_dir / "record-net.json").write_text("{}")
+    monkeypatch.setattr(
+        "outlook_mcp.auth._auth_record_path",
+        lambda account=None: (
+            record_dir / ("legacy.json" if account is None else f"record-{account}.json")
+        ),
+    )
+    records: dict = {"net": object(), "neko": object()}
+    monkeypatch.setattr(
+        "outlook_mcp.auth._load_auth_record", lambda account=None: records.get(account)
+    )
+
+    config = _two_account_config()
+    auth = AuthManager(config)
+    cred = MagicMock()
+    cred.get_token = MagicMock(return_value=None)
+    monkeypatch.setattr(AuthManager, "_make_credential", lambda *a, **k: cred)
+
+    with caplog.at_level("WARNING", logger="outlook_mcp.auth"):
+        assert auth.try_cached_token() is True
+
+    assert "Adopting" not in caplog.text

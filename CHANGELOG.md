@@ -43,7 +43,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (default `false`) is the master switch for everything beyond the configured routing: when off,
   the agent sees one merged account and `outlook_switch_account` refuses; when on, it can switch
   the active account or re-route a single capability. Config validation is accept-and-warn for
-  shapes 1.21 accepted, so upgrading a working install cannot brick it at startup.
+  shapes 1.21 accepted, so upgrading a working install cannot brick it at startup — and an install
+  that had populated `accounts` on 1.21 keeps its login: the pre-multi-account `auth_record.json`
+  is adopted as the default account's record (with a warning) instead of being silently ignored.
 
 ### Changed
 

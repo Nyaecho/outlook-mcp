@@ -338,6 +338,9 @@ class AuthManager:
         if not self.config.accounts:
             return self._try_single_cached_token(None)
 
+        assert self._active_account is not None  # set by config validation
+        self._adopt_legacy_login(self._active_account)
+
         any_ok = False
         for acc in self.config.accounts:
             if self._try_single_cached_token(acc.name):
@@ -355,6 +358,32 @@ class AuthManager:
                 fallback,
             )
         return any_ok
+
+    def _adopt_legacy_login(self, account: str) -> None:
+        """Carry a pre-multi-account login over to the default account.
+
+        1.21 and earlier logged in once (auth_record.json) even when
+        'accounts' was populated — the list did nothing, so that one login
+        served everything. An upgrade that ignores it silently drops a
+        working install's login: every account would start unauthenticated.
+        Adopt the legacy record as the default account's (the identity that
+        served everything yesterday), say so, and let the other accounts
+        fail closed with their own `outlook-mcp auth <name>` remedy.
+        """
+        if _auth_record_path(account).exists() or not _auth_record_path(None).exists():
+            return
+        record = _load_auth_record(None)
+        if record is None:
+            return
+        logger.warning(
+            "Found a pre-multi-account login (auth_record.json) and no record "
+            "for account '%s'. Adopting it as '%s'; if that is the wrong "
+            "identity, run `outlook-mcp auth %s`.",
+            account,
+            account,
+            account,
+        )
+        _save_auth_record(record, account)
 
     def _try_single_cached_token(self, account: str | None) -> bool:
         """The silent single-account path, parameterized by account."""
