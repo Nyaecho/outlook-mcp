@@ -272,6 +272,13 @@ async def outlook_auth_status(ctx: Context) -> dict:
             # Re-running auth would fail identically; say what actually needs
             # changing.
             result["action_required"] = str(auth.startup_error)
+        elif auth.config.accounts and auth.active_account:
+            # Status reflects the ACTIVE account only (review of #61): name
+            # it, so the remedy says which auth command to run.
+            result["action_required"] = (
+                f"Run `outlook-mcp auth {auth.active_account}` on the host to "
+                "authenticate the active account."
+            )
         else:
             result["action_required"] = "Run `outlook-mcp auth` on the host to authenticate."
     return result

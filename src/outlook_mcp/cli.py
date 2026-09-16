@@ -119,8 +119,9 @@ def cmd_status() -> None:
         return
 
     ok = auth.try_cached_token()
+    authenticated = set(auth.authenticated_accounts)
     for acc in config.accounts:
-        status = "authenticated" if acc.name in auth._credentials else "not authenticated"
+        status = "authenticated" if acc.name in authenticated else "not authenticated"
         marker = " (default)" if acc.name == config.default_account else ""
         print(f"  {acc.name}: {status}{marker}")
     if not ok:

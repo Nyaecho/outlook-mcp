@@ -162,6 +162,21 @@ class AuthManager:
         # tool call, not only stderr.
         self.startup_error: OutlookMCPError | None = None
 
+    @property
+    def authenticated_accounts(self) -> list[str]:
+        """Names of accounts holding a valid credential this run."""
+        return list(self._credentials)
+
+    @property
+    def active_account(self) -> str | None:
+        """The configured active account (None on single-account installs).
+
+        Never silently re-pointed — it moves only via config or an explicit,
+        gated switch_account. Auth surfaces report it so their remedies name
+        the account that actually needs authenticating.
+        """
+        return self._active_account
+
     def get_scopes(self) -> list[str]:
         """Return individual scopes for display/consent purposes."""
         return SCOPES_READONLY if self.config.read_only else SCOPES_READWRITE

@@ -444,3 +444,25 @@ def test_logout_clears_identity_fallback_when_it_is_the_logout_target(tmp_path, 
 
     assert auth._identity_fallback_account is None
     assert auth.resolve_capability_account(None) == "net"  # identity follows config again
+
+
+# ── Auth surfaces reflect the active account ─────────────
+
+
+@pytest.mark.asyncio
+async def test_auth_status_names_the_active_account_when_unauthenticated():
+    """auth_status reflects the ACTIVE account only, and its remedy names it
+    (review of #61: the auth surfaces must not describe a different account
+    than the one whose credentials will actually be used)."""
+    from outlook_mcp import server as server_mod
+
+    config = _two_account_config()
+    auth = AuthManager(config)  # startup found nothing authenticatable
+
+    ctx = MagicMock()
+    ctx.request_context.lifespan_context = {"auth": auth, "config": config}
+
+    result = await server_mod.outlook_auth_status(ctx)
+
+    assert result["authenticated"] is False
+    assert "outlook-mcp auth net" in result["action_required"]
