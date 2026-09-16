@@ -64,10 +64,11 @@ def _resolve_account_arg(config: Config, arg: str | None) -> str | None:
 def cmd_auth(account: str | None = None) -> None:
     """Interactive device code auth — run this in a terminal."""
     config = _load_config_or_exit()
-    if config.accounts:
-        account = account or config.default_account
-    else:
-        account = _resolve_account_arg(config, account)  # exits with an explanation
+    # Validate an explicit name before printing anything: the device-code
+    # banner must not appear for an account that cannot exist.
+    account = _resolve_account_arg(config, account)
+    if config.accounts and account is None:
+        account = config.default_account
     client_id = config.client_id if account is None else None
     if account is not None:
         client_id = next((a.client_id for a in config.accounts if a.name == account), None)
