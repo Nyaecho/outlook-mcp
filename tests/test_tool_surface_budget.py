@@ -30,10 +30,11 @@ CHARS_PER_TOKEN = 4
 
 # Ceiling for the full tool surface. Measured at 11,206 on 1.20.0 with a
 # 12,000 ceiling; raised to 13,500 (measured 12,712) for the eight To Do detail
-# tools (get_task, checklist-item CRUD, task attachments) — a deliberate
-# "a new tool has to go somewhere" raise, not drift. Headroom is back to
-# ~6%: room for a docstring fix, not for another batch.
-TOOL_SURFACE_CEILING = 13_500
+# tools (get_task, checklist-item CRUD, task attachments), then to 13,650
+# after the attachment rewrite (measured 12,855) — each a deliberate
+# "a new tool has to go somewhere" raise, not drift. Headroom is ~6%: room
+# for a docstring fix, not for another batch.
+TOOL_SURFACE_CEILING = 13_650
 
 # `prompts/list` is the cheap half of the bargain struck in 1.20.0: workflow
 # guidance costs a name and one line here until someone invokes it. If that ever
