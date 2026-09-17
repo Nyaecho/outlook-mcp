@@ -20,37 +20,175 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+# Every field _format_contact_summary reads, and nothing it does not. A $select
+# narrower than the formatter silently blanks whatever it leaves out, and a
+# wider one pays for bytes nobody reads. (givenName, surname and title were the
+# latter: selected since forever, never read by the summary shape.)
+_SUMMARY_SELECT = "id,displayName,emailAddresses,mobilePhone,homePhones,businessPhones,companyName"
+
+# Only the listing asks for categories. Graph's $search on contacts does not
+# return them — verified against live Graph, empty under a narrow $select, a
+# wide one, and no $select at all — so a search result carrying the key would
+# report every contact as uncategorised, which is exactly the "empty means
+# absent" confusion this module is trying to stop telling. The listing gets the
+# field; the search omits the key rather than lying about it.
+_LIST_SELECT = _SUMMARY_SELECT + ",categories"
+
+# get_contact sends no $select at all, so Graph returns the whole contact and
+# the detail formatter can read whatever it likes: the data was never the
+# problem there, the formatter simply did not read these five.
+#
+# One tuple, read and write. The read path returns these keys and the write path
+# accepts them, so handing an address straight back — the documented way to keep
+# the parts you are not changing — is mechanical rather than a renaming exercise.
+_ADDRESS_FIELDS = ("street", "city", "state", "postal_code", "country_or_region")
+
+
+def _format_address(address: Any) -> dict | None:
+    """Flatten a Graph ``physicalAddress``, or ``None`` when it holds nothing.
+
+    Graph hands back an empty address object rather than null for addresses the
+    contact does not have, so an emptiness check is what distinguishes "no home
+    address" from "a home address whose street we failed to read". Whitespace is
+    not content — :func:`_build_address` refuses to write a blank part, so an
+    address of spaces reported here as real would be one this tool tells you to
+    hand back and then rejects.
+    """
+    parts = {
+        field: sanitize_output(getattr(address, field, "") or "", multiline=True)
+        for field in _ADDRESS_FIELDS
+    }
+    return parts if any(value.strip() for value in parts.values()) else None
+
+
+def _build_address(slot: str, parts: Any) -> Any:
+    """A Graph ``physicalAddress`` from the shape :func:`_format_address` returns.
+
+    The mirror of the read path, field for field: a write path that cannot
+    express what the read path returns is how an address ends up readable but
+    not correctable.
+
+    An unknown key is an error rather than a silent drop. The caller is a model
+    reading a docstring, and a misspelt part that patched nothing would be the
+    #41 shape again — a call that succeeds and does nothing. Raised as a plain
+    ``ValueError``, like every other tool module: ``_wrap_tool_errors`` turns it
+    into ``ToolInputError`` so the text reaches the model as an anticipated
+    failure rather than being withheld as a crash.
+
+    A part that was not supplied is **left unset**, never assigned ``None``.
+    Graph's request adapter serializes through the backing store, which emits a
+    field that was explicitly set to ``None`` — and for a nested model it emits
+    it onto the *parent*, under its Python name. A city-only address therefore
+    went out as ``{"country_or_region": null, ..., "homeAddress": {"city": …}}``
+    and Graph answered ``400 The property 'country_or_region' does not exist on
+    type 'microsoft.graph.contact'``. Assigning only what we were given is the
+    whole fix; ``TestPartialAddressDoesNotLeakNulls`` pins it.
+    """
+    from msgraph.generated.models.physical_address import PhysicalAddress
+
+    if not isinstance(parts, dict):
+        raise ValueError(
+            f"{slot}_address takes an object like "
+            f"{{'street': '…', 'city': '…'}}, not {type(parts).__name__}. "
+            f"Valid parts: {', '.join(_ADDRESS_FIELDS)}."
+        )
+    unknown = [key for key in parts if key not in _ADDRESS_FIELDS]
+    if unknown:
+        raise ValueError(
+            f"{slot}_address has unknown part(s): {', '.join(sorted(unknown))}. "
+            f"Valid parts: {', '.join(_ADDRESS_FIELDS)} — the same keys "
+            f"outlook_get_contact returns."
+        )
+
+    present = {}
+    for field, value in parts.items():
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{slot}_address['{field}'] must be a string, not {type(value).__name__}."
+            )
+        if value.strip():
+            present[field] = value.strip()
+
+    if not present:
+        # Reporting "updated" for a patch that carried nothing is the failure
+        # this module exists to stop telling. Clearing an address is a separate
+        # capability nobody has asked for yet; until then, say so.
+        raise ValueError(
+            f"{slot}_address has no content. Omit it to leave the stored address "
+            f"unchanged — this tool cannot clear an address."
+        )
+
+    # Assigned field by field rather than through a `setattr` loop: an attribute
+    # that is not a real SDK field is a silent no-op (#41's shape), and the
+    # static guard that catches those — test_sdk_fields_exist — reads
+    # `<var>.<attr> = ...` and cannot see `setattr`.
+    address = PhysicalAddress()
+    if "street" in present:
+        address.street = present["street"]
+    if "city" in present:
+        address.city = present["city"]
+    if "state" in present:
+        address.state = present["state"]
+    if "postal_code" in present:
+        address.postal_code = present["postal_code"]
+    if "country_or_region" in present:
+        address.country_or_region = present["country_or_region"]
+    return address
+
+
 def _primary_phone(contact: Any) -> str:
     """Pick the most representative phone from the consumer-Graph contact fields.
 
     Consumer Outlook accounts expose mobilePhone (single), homePhones (list),
     and businessPhones (list) — not the unified ``phones`` collection. Prefer
     mobile, then first home, then first business.
+
+    Spelled out rather than looped over a tuple of names: a ``getattr`` whose
+    attribute is a variable is invisible to `test_select_covers_the_formatter`,
+    which reads this source to derive what the `$select` must ask for. A loop
+    here would take `homePhones` and `businessPhones` out from under the guard
+    that exists to keep a formatter and its `$select` in agreement.
     """
     mobile = getattr(contact, "mobile_phone", "") or ""
     if mobile:
         return mobile
-    for attr in ("home_phones", "business_phones"):
-        values = getattr(contact, attr, None) or []
-        if values:
-            return values[0]
+    home = getattr(contact, "home_phones", None) or []
+    if home:
+        return home[0]
+    business = getattr(contact, "business_phones", None) or []
+    if business:
+        return business[0]
     return ""
 
 
-def _format_contact_summary(contact: Any) -> dict:
-    """Convert Graph SDK contact to summary dict."""
+def _categories(contact: Any) -> list[str]:
+    """Graph's categories, sanitized. A contact's own text, so treat it as such."""
+    return [sanitize_output(c) for c in (getattr(contact, "categories", None) or [])]
+
+
+def _format_contact_summary(contact: Any, *, with_categories: bool = False) -> dict:
+    """Convert Graph SDK contact to summary dict.
+
+    ``with_categories`` is opt-in because only the listing path can honour it;
+    see ``_LIST_SELECT``.
+    """
     email = ""
     if contact.email_addresses:
         first_email = contact.email_addresses[0]
         email = getattr(first_email, "address", "") or ""
 
-    return {
+    summary = {
         "id": contact.id,
         "display_name": sanitize_output(contact.display_name or ""),
         "email": email,
         "phone": _primary_phone(contact),
         "company": sanitize_output(contact.company_name or ""),
     }
+    if with_categories:
+        summary["categories"] = _categories(contact)
+    return summary
 
 
 def _format_contact_detail(contact: Any) -> dict:
@@ -77,6 +215,17 @@ def _format_contact_detail(contact: Any) -> dict:
         "title": sanitize_output(contact.title or ""),
         "department": sanitize_output(getattr(contact, "department", "") or ""),
         "birthday": str(contact.birthday) if contact.birthday else None,
+        "home_address": _format_address(getattr(contact, "home_address", None)),
+        "business_address": _format_address(getattr(contact, "business_address", None)),
+        "other_address": _format_address(getattr(contact, "other_address", None)),
+        "categories": _categories(contact),
+        # A note is body-shaped text: Outlook's box is multi-line, and every
+        # other body field in the repo keeps its line breaks. Flattened, a note
+        # comes back as one run-on line carrying a stray CR that a terminal
+        # client will use to overwrite whatever it already printed.
+        "personal_notes": sanitize_output(
+            getattr(contact, "personal_notes", "") or "", multiline=True
+        ),
     }
 
 
@@ -88,10 +237,7 @@ async def list_contacts(
     """List contacts with pagination."""
     query_params: dict[str, Any] = {
         "$orderby": "displayName",
-        "$select": (
-            "id,displayName,givenName,surname,emailAddresses,"
-            "mobilePhone,homePhones,businessPhones,companyName,title"
-        ),
+        "$select": _LIST_SELECT,
     }
     query_params = apply_pagination(query_params, count, cursor)
 
@@ -104,7 +250,7 @@ async def list_contacts(
     )
     response = await graph_client.me.contacts.get(request_configuration=req_config)
 
-    contacts = [_format_contact_summary(c) for c in (response.value or [])]
+    contacts = [_format_contact_summary(c, with_categories=True) for c in (response.value or [])]
     next_cursor = wrap_nextlink(response.odata_next_link)
 
     return {
@@ -127,10 +273,7 @@ async def search_contacts(
     query_params: dict[str, Any] = {
         "$top": count,
         "$search": safe_query,
-        "$select": (
-            "id,displayName,givenName,surname,emailAddresses,"
-            "mobilePhone,homePhones,businessPhones,companyName,title"
-        ),
+        "$select": _SUMMARY_SELECT,
     }
 
     from msgraph.generated.users.item.contacts.contacts_request_builder import (
@@ -217,16 +360,30 @@ async def update_contact(
     last_name: str | None = None,
     email: str | None = None,
     phone: str | None = None,
+    home_address: dict | None = None,
+    business_address: dict | None = None,
+    other_address: dict | None = None,
     *,
     config: Config,
 ) -> dict:
-    """Update an existing contact (partial patch)."""
+    """Update an existing contact (partial patch).
+
+    Each address takes the shape :func:`get_contact` returns — any subset of
+    ``street``, ``city``, ``state``, ``postal_code``, ``country_or_region`` —
+    and Graph **replaces** that whole address object rather than merging into
+    it: parts not supplied come back empty, not preserved. So pass back every
+    part you intend to keep, which is why the read and write halves name the
+    same five fields. Omit an address entirely to leave it untouched.
+    """
     check_permission(config, CATEGORY_CONTACTS_WRITE, "outlook_update_contact")
     contact_id = validate_graph_id(contact_id)
 
-    if email:
+    # `is not None`, not truthiness: `email=""` is a caller asking for something
+    # this tool cannot do, and it used to skip validation and reach Graph as a
+    # blank address. One meaning for "provided" per argument.
+    if email is not None:
         validate_email(email)
-    if phone:
+    if phone is not None:
         validate_phone(phone)
 
     from msgraph.generated.models.contact import Contact
@@ -243,6 +400,13 @@ async def update_contact(
         patch_body.email_addresses = [ea]
     if phone is not None:
         patch_body.mobile_phone = phone
+
+    if home_address is not None:
+        patch_body.home_address = _build_address("home", home_address)
+    if business_address is not None:
+        patch_body.business_address = _build_address("business", business_address)
+    if other_address is not None:
+        patch_body.other_address = _build_address("other", other_address)
 
     await graph_client.me.contacts.by_contact_id(contact_id).patch(patch_body)
 
