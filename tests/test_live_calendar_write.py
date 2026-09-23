@@ -683,3 +683,127 @@ class TestTimeZoneAnchoring:
             assert end_hour - start_hour == 6
         finally:
             await delete_event(real_graph_client.sdk_client, event_id, config=live_write_config)
+
+
+class TestShowAsIsHonoured:
+    """Graph stores every `showAs` value we accept — the claim behind the tool.
+
+    This is the assertion the mock tier structurally cannot make. A mock sees
+    the enum on the model and the camelCase key on the wire; neither can tell a
+    field Graph *stores* from one it accepts with a 201 and drops. That is not
+    hypothetical here — it is exactly what `isOnlineMeeting` does on a consumer
+    mailbox, which is why `create_event` has an `is_online` that has never done
+    anything and a live test saying so.
+
+    No `consumer_mailbox_only` gate, deliberately. That fixture is for claims
+    that something does *not* work on a personal account, where a work account
+    would fail the test correctly and tell us nothing. "Graph honours showAs"
+    should hold on both, so gating it would hide the half that runs everywhere.
+    """
+
+    async def test_create_stores_the_show_as_it_was_given(
+        self, real_graph_client, live_write_config
+    ):
+        monday = _anchor_monday()
+
+        async with _temporary_event(
+            real_graph_client,
+            live_write_config,
+            start=f"{monday.isoformat()}T19:00:00Z",
+            end=f"{monday.isoformat()}T19:30:00Z",
+            show_as="tentative",
+        ) as event_id:
+            read_back = await get_event(real_graph_client.sdk_client, event_id)
+
+            assert read_back["show_as"] == "tentative", (
+                "Graph accepted the POST and did not store showAs — the same "
+                "shape as isOnlineMeeting on a consumer mailbox."
+            )
+
+    @pytest.mark.parametrize(
+        "value", ["free", "tentative", "busy", "oof", "workingElsewhere", "unknown"]
+    )
+    async def test_patch_stores_every_value_the_tool_accepts(
+        self, real_graph_client, live_write_config, value
+    ):
+        """Every accepted value, not just the interesting ones.
+
+        A tool that advertises six and stores four would look correct in every
+        hand-check that reached for `tentative` — and `unknown` is here because
+        the tool accepts it on the strength of this exact round trip, not on
+        the strength of the documentation.
+
+        Every case has to be a real *transition*. Creating the event without a
+        `show_as` lets Graph apply its default of `busy`, and the `busy`
+        parameter would then assert `busy == busy` with the PATCH doing
+        nothing — passing just as happily if Graph started dropping `showAs`
+        the way it dropped `isOnlineMeeting`. So the event is created at a
+        value the case under test never uses.
+
+        The starting value must also never be `busy`, for the same reason one
+        level down: `busy` is what Graph applies on its own, so a premise guard
+        asserting the event started there holds whether or not *create* stored
+        anything. The `free` case used to start from `busy` and was the one
+        case still proving nothing.
+        """
+        monday = _anchor_monday()
+        initial = "free" if value != "free" else "tentative"
+
+        async with _temporary_event(
+            real_graph_client,
+            live_write_config,
+            start=f"{monday.isoformat()}T20:00:00Z",
+            end=f"{monday.isoformat()}T20:30:00Z",
+            show_as=initial,
+        ) as event_id:
+            # Guard the premise: the transition below only means anything if
+            # the event really started somewhere else. Without this, a Graph
+            # regression on *create* would leave the event at `busy` and quietly
+            # turn four of these six cases back into the vacuous assertion the
+            # `initial` value exists to prevent.
+            before = await get_event(real_graph_client.sdk_client, event_id)
+            assert before["show_as"] == initial, (
+                f"event was created with show_as={initial!r} but reads back as "
+                f"{before['show_as']!r} — the premise of this test is gone, so a "
+                f"passing assertion below would prove nothing"
+            )
+
+            await update_event(
+                real_graph_client.sdk_client,
+                event_id=event_id,
+                show_as=value,
+                config=live_write_config,
+            )
+
+            read_back = await get_event(real_graph_client.sdk_client, event_id)
+            assert read_back["show_as"] == value
+
+    async def test_patching_show_as_alone_leaves_the_rest_of_the_event(
+        self, real_graph_client, live_write_config
+    ):
+        """Unlike isAllDay, showAs needs nothing resent — and must clear nothing.
+
+        The wire guard proves we *send* only showAs. This proves Graph does not
+        treat the absent fields as cleared, which is the half that lives on the
+        server.
+        """
+        monday = _anchor_monday()
+
+        async with _temporary_event(
+            real_graph_client,
+            live_write_config,
+            start=f"{monday.isoformat()}T21:00:00Z",
+            end=f"{monday.isoformat()}T21:30:00Z",
+            location="Room 101",
+        ) as event_id:
+            await update_event(
+                real_graph_client.sdk_client,
+                event_id=event_id,
+                show_as="free",
+                config=live_write_config,
+            )
+
+            after = await get_event(real_graph_client.sdk_client, event_id)
+            assert after["show_as"] == "free"
+            assert after["location"] == "Room 101"
+            assert "21:00:00" in after["start"]

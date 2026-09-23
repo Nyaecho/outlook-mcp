@@ -85,6 +85,60 @@ def _as_instant(date_time: str, projected_zone: str | None) -> str:
         return text
     return text + "Z"
 
+# Spellings an agent plausibly emits for the two Graph values whose names don't
+# match Outlook's own menu labels ("Out of office", "Working elsewhere"), mapped
+# to the normalised form of the real value. Widening what we accept cannot break
+# the advertised contract; the refusal path is where a sanitizer does damage
+# (#30), so that message names every valid value instead of guessing.
+_FREE_BUSY_ALIASES = {
+    "out_of_office": "oof",
+    "outofoffice": "oof",
+    "working_elsewhere": "workingelsewhere",
+}
+
+
+def _free_busy(value: str) -> Any:
+    """Resolve a ``show_as`` string to the SDK's ``FreeBusyStatus`` member.
+
+    Accepts the six Graph values case-insensitively, plus the aliases above;
+    spaces and hyphens normalise to underscores, so "Out of office" and
+    "working-elsewhere" both land.
+
+    ``unknown`` is accepted even though Outlook's menu does not offer it. It is
+    Graph's sentinel for a status it cannot determine, and Graph stores it on
+    both POST and PATCH — verified live on a consumer mailbox, sent and read
+    back on a fresh GET. Refusing it would break the round trip this project
+    keeps elsewhere: an event read back as ``show_as: "unknown"`` has to be
+    writable back unchanged, so the value ``get`` returns is a value ``create``
+    takes.
+    """
+    from msgraph.generated.models.free_busy_status import FreeBusyStatus
+
+    valid = [member.value for member in FreeBusyStatus]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"show_as must be one of: {valid}. Omit it to leave the event's "
+            f"busy status alone — this tool cannot clear it."
+        )
+
+    normalised = value.strip().lower().replace(" ", "_").replace("-", "_")
+    normalised = _FREE_BUSY_ALIASES.get(normalised, normalised)
+
+    for member in FreeBusyStatus:
+        if member.value.lower() == normalised:
+            return member
+
+    # The valid set is derived from the enum so it cannot drift. The sentence
+    # after it names only the two values whose Graph spelling differs from the
+    # label Outlook shows — the same two `_FREE_BUSY_ALIASES` exists for — and
+    # no longer claims to translate the whole list. Naming all six would mean
+    # inventing an Outlook label for `unknown`, which the UI does not offer,
+    # so the enumeration is the part that had to go rather than the hint.
+    raise ValueError(
+        f"Invalid show_as '{value[:50]}'. Must be one of: {valid}. Outlook labels "
+        f"'oof' as Out of office and 'workingElsewhere' as Working elsewhere."
+    )
+
 
 async def create_event(
     graph_client: Any,
@@ -98,6 +152,7 @@ async def create_event(
     is_online: bool = False,
     recurrence: dict | str | None = None,
     timezone: str | None = None,
+    show_as: str | None = None,
     *,
     config: Config,
 ) -> dict:
@@ -128,6 +183,18 @@ async def create_event(
     the host's clock is the bug 1.15.0 removed; and Graph requires an all-day
     event to start on a midnight boundary, which a UTC conversion of local
     midnight is not.
+
+    ``show_as`` is Graph's ``showAs`` — the free/busy status Outlook labels
+    "Show as". Omitted, Graph applies its own default (``busy``); we do not
+    send one, so the default stays Graph's to change.
+
+    New parameters are appended to this signature rather than inserted:
+    ``create_event`` is importable from the published package and nothing after
+    ``graph_client`` is keyword-only, so a mid-signature insert would rebind a
+    positional argument for an external caller. ``show_as`` therefore sits
+    after ``timezone``, and ``server.py``'s positional call has to agree — a
+    disagreement there only misfires when a value is actually supplied, so a
+    green suite proves nothing about it.
     """
     check_permission(config, CATEGORY_CALENDAR_WRITE, "outlook_create_event")
 
@@ -157,6 +224,11 @@ async def create_event(
     validated_attendees = []
     if attendees:
         validated_attendees = [validate_email(e) for e in attendees]
+
+    # Resolved here rather than at the assignment, so every argument is checked
+    # before anything is sent. `update_event` has the same ordering for a
+    # sharper reason (see there); these two stay the same shape deliberately.
+    resolved_show_as = _free_busy(show_as) if show_as is not None else None
 
     from msgraph.generated.models.attendee import Attendee
     from msgraph.generated.models.body_type import BodyType
@@ -200,6 +272,9 @@ async def create_event(
     if recurrence:
         event.recurrence = build_event_recurrence(recurrence, start=start, zone=zone)
 
+    if resolved_show_as is not None:
+        event.show_as = resolved_show_as
+
     response = await graph_client.me.events.post(event)
 
     return {
@@ -221,6 +296,7 @@ async def update_event(
     remove_recurrence: bool = False,
     attendees: list[str] | None = None,
     is_all_day: bool | None = None,
+    show_as: str | None = None,
     *,
     config: Config,
 ) -> dict:
@@ -289,6 +365,11 @@ async def update_event(
     ``test_setting_event_recurrence_none_is_unsendable`` pins that; if kiota
     ever starts emitting a usable top-level null, it fails and this can be
     simplified.
+
+    ``show_as`` patches Graph's ``showAs`` and needs nothing else resent — it is
+    not ``is_all_day``. Graph honours all six values on PATCH for a consumer
+    mailbox, verified live. Omitting it leaves the event's current status alone;
+    there is no value that clears one, because Graph has no such state.
     """
     check_permission(config, CATEGORY_CALENDAR_WRITE, "outlook_update_event")
     event_id = validate_graph_id(event_id)
@@ -318,6 +399,13 @@ async def update_event(
     validated_attendees = None
     if attendees is not None:
         validated_attendees = [validate_email(e) for e in attendees]
+
+    # Resolved here, with the other argument checks, rather than at the
+    # assignment far below: every read path in this function is lazy, so a
+    # `show_as` refused late would still have cost the `current_event()` GET
+    # that a recurrence or a time patch triggers. Validating before any await
+    # is the rule this function already follows for datetimes and attendees.
+    resolved_show_as = _free_busy(show_as) if show_as is not None else None
 
     # The event as Graph currently holds it, fetched at most once and only when
     # something actually needs it: the zone a start/end patch must carry, the
@@ -427,6 +515,9 @@ async def update_event(
             stored_start = getattr(existing, "start", None)
             anchor = _as_instant(anchor, getattr(stored_start, "time_zone", None))
         event.recurrence = build_event_recurrence(recurrence, start=anchor, zone=anchor_zone)
+
+    if resolved_show_as is not None:
+        event.show_as = resolved_show_as
 
     response = await graph_client.me.events.by_event_id(event_id).patch(event)
 
