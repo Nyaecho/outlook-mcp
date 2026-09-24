@@ -47,6 +47,7 @@ from outlook_mcp.tools.calendar_read import list_events
 from outlook_mcp.tools.contacts import list_contacts, search_contacts
 from outlook_mcp.tools.mail_read import list_inbox, search_mail
 from outlook_mcp.tools.mail_thread import list_thread
+from outlook_mcp.tools.todo import get_task, list_tasks
 
 pytestmark = [pytest.mark.live, pytest.mark.asyncio]
 
@@ -413,3 +414,54 @@ async def test_the_event_listing_returns_the_show_as_it_selects(real_graph_clien
 # Nothing is left for the live tier to see here, because an omitted field has
 # no wire behaviour for Graph to get wrong — unlike the positive case above,
 # where a `$select` Graph silently ignores is invisible to a mock.
+# ── todo: $expand=checklistItems on a single-task GET ──
+
+
+async def test_get_task_checklist_expand_is_accepted(real_graph_client):
+    """get_task's $expand=checklistItems must come back, not 400 and not silently empty.
+
+    The mock suite can only assert we write "checklistItems" into the query
+    configuration; only Graph decides whether the expansion is legal on this
+    endpoint and actually populates task.checklistItems.
+
+    This tier is read-only, so it cannot create sub-steps; it scans the
+    default list for a task that already has some and skips (loudly) when
+    there is none — an unconditional pass against an empty checklist was the
+    condition that let the 1.22.0 `.value` crash ship.
+    """
+    page = await list_tasks(real_graph_client.sdk_client, count=10)
+    detail = None
+    for task in page["tasks"]:
+        candidate = await get_task(real_graph_client.sdk_client, task["id"])
+        if candidate["checklist_count"] > 0:
+            detail = candidate
+            break
+    if detail is None:
+        pytest.skip(
+            "no task in the first 10 of the default list has checklist items — "
+            "the write tier (TestChecklistRoundTrip) owns the guarantee instead"
+        )
+
+    assert detail["checklist_count"] > 0
+    for item in detail["checklist_items"]:
+        assert item["id"]
+        assert isinstance(item["display_name"], str)
+        assert isinstance(item["is_checked"], bool)
+    # Unchecked-first ordering is part of the tool's contract: an agent reads
+    # the first unchecked item as "the next step". Rather than compare the
+    # emission to its own sort (which can only re-verify Python's sorted()),
+    # assert the contract directly — pairwise, no checked item precedes an
+    # unchecked one and `created` never runs backwards within a group.
+    items = detail["checklist_items"]
+    for earlier, later in zip(items, items[1:]):
+        assert (earlier["is_checked"], earlier["created"]) <= (
+            later["is_checked"],
+            later["created"],
+        ), f"checklist order broke the (is_checked, created) key: {items}"
+    # And the load-bearing half for an agent loop: two identical calls on an
+    # unchanged task emit the same order — a nondeterministic "next step" is
+    # the bug this contract exists to prevent.
+    again = await get_task(real_graph_client.sdk_client, detail["id"])
+    assert [(i["is_checked"], i["created"]) for i in again["checklist_items"]] == [
+        (i["is_checked"], i["created"]) for i in items
+    ]

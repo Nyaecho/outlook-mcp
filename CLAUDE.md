@@ -40,6 +40,7 @@ Still manual by design: the live tier (run it *before* tagging) and ClawHub.
   - `calendar_read.py`, `calendar_write.py` — Tier 1
   - `contacts.py` — Contact CRUD
   - `todo.py` — To Do task management
+  - `todo_attachments.py` — To Do task attachments (inline base64 uploads ≤20 MiB, contentBytes downloads)
   - `mail_drafts.py` — Draft management
   - `mail_attachments.py` — Attachment handling
   - `mail_folders.py` — Folder management
@@ -63,7 +64,8 @@ Still manual by design: the live tier (run it *before* tagging) and ClawHub.
   no hand-written Pydantic I/O layer — one existed until 1.16.0, was wired to nothing, and
   is why #41 went unnoticed for fourteen releases: a validator that looked authoritative and
   never ran. If you add one, wire it to the tool path in the same commit.
-- No telemetry, no local caching, no third-party calls
+- No telemetry, no local caching, no third-party calls (carve-out: the To Do default-list
+  id is resolved once per Graph client and kept — an id, not content)
 - Tests: TDD, pytest, mock Graph client for unit tests. Four offline guards against the silent-no-op class that produced #41 — a call that succeeds and does nothing: `test_no_dead_parameters.py` (parameter declared, never read), `test_no_dead_modules.py` (module nothing imports), `test_sdk_fields_exist.py` (attribute assigned on an SDK model that has no such field — the SDK drops it silently), `test_write_payloads_reach_the_wire.py` (each write argument must appear in the *serialized* payload, not just on the model). Fix the finding or justify an allowlist entry in the file; never weaken the guard. Mocks assert what we *send* — they cannot see a query Graph rejects or silently mis-evaluates, so anything that builds a `$filter`/`$orderby`/`$search` string also needs a `@pytest.mark.live` guard
 - Errors: raise OutlookMCPError subclasses, never return error dicts. They inherit the SDK's
   `ToolError` — an *anticipated* failure, whose text the SDK forwards to the model. Anything
@@ -72,13 +74,17 @@ Still manual by design: the live tier (run it *before* tagging) and ClawHub.
   suppressed the entire hierarchy from 1.14.0 to 1.19.0 while every type assertion stayed green.
   A new error type inherits from `OutlookMCPError`, and `__str__` carries the `action` hint
   because that string is what the agent reads. Guarded by `test_error_text_reaches_client.py`
-- Cross-tool guidance goes in `INSTRUCTIONS` (sent once per session) or a prompt, never into 62
+- Cross-tool guidance goes in `INSTRUCTIONS` (sent once per session) or a prompt, never into 70
   docstrings — a docstring is paid for on every turn by every client. A docstring stays
   self-sufficient for using *that* tool; sequencing across tools does not belong there
 - Anything taking a host filesystem path routes through `resolve_attachment_path`. Paths come
   from the model, and the model reads email — treat them as untrusted input, and confine by
   resolving, never by string comparison
-- Tool schemas are a per-turn cost with a measured baseline (~8,644 tokens for 62 tools).
+- Tool schemas are a per-turn cost with a measured baseline — two yardsticks, never compared
+  with each other: ~8,644 **o200k** tokens for the 62-tool surface (real tokenizer, ROADMAP
+  2026-07) and ~13.2k **chars/4 proxy** tokens for the 70-tool surface with the To Do detail
+  tools (the budget test's own measure; under the same yardstick the 62-tool surface is
+  ~11.7k, so the To Do detail set costs ~+12% per turn).
   Metadata that is correct but inert — `openWorldHint`, which is `true` by default anyway, or
   titles that restate the tool name — is not free. `test_tool_surface_budget.py` holds the line
 - Datetimes: UTC in responses, config timezone for input interpretation

@@ -33,6 +33,11 @@ EXPECTED_IDEMPOTENT = {
     "outlook_set_inbox_override",
     "outlook_switch_account",
     "outlook_download_attachment",
+    # Same audit as their mail twins: an absolute-value PATCH
+    # (checklist check-off/rename) and a download that overwrites a fixed
+    # path with the same bytes.
+    "outlook_download_task_attachment",
+    "outlook_update_checklist_item",
 }
 
 
@@ -91,10 +96,10 @@ async def test_the_hint_reaches_the_wire():
 def test_open_world_hint_is_left_to_the_default():
     """It is true by default in the schema, so stating it costs tokens and says nothing.
 
-    Every one of the 62 reaches Microsoft Graph, so the value would be `true` on
-    all of them — which is exactly what a client already assumes when the field
-    is absent. On a surface measured at ~8.6k tokens a turn, correct-but-inert
-    metadata is not free.
+    Every one of the tools reaches Microsoft Graph, so the value would be `true`
+    on all of them — which is exactly what a client already assumes when the
+    field is absent. On a surface measured at ~13k chars/4 proxy tokens a turn
+    (see test_tool_surface_budget.py), correct-but-inert metadata is not free.
     """
     from outlook_mcp.toolsets import annotation_for
 

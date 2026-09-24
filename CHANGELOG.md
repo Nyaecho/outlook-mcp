@@ -134,7 +134,42 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
   Thanks to **@Nyaecho** for the feature (#62).
 
+- **To Do tasks grew sub-steps, detail reads, and attachments (8 new tools).**
+  `outlook_get_task` reads one task in full — notes, due, recurrence flag, and its checklist
+  items via `$expand=checklistItems`, ordered unchecked-first with creation time as the
+  tiebreak (deterministic, so the first open item stably reads as "the next step").
+  `outlook_add_checklist_item`, `outlook_update_checklist_item` (partial
+  patch: `is_checked` or rename) and `outlook_delete_checklist_item` manage those sub-steps.
+  Task attachments are their own resource, not mail FileAttachments: creation is an inline
+  base64 POST of a `taskFileAttachment` — verified live on a consumer outlook.com mailbox
+  from 64 bytes to the full 20 MiB ceiling. (The upload-session route exists on those
+  accounts too — `createUploadSession` answers 201 — but its upload URL is a Graph route,
+  so every chunk PUT needs `Authorization` and `Content-Type` headers, response checking,
+  and `nextExpectedRanges` handling; inline stays the simpler, verified path at these
+  sizes and sessions are the documented future route above 20 MiB.) The client-side
+  ceiling is **1 byte – 20 MiB**: Graph rejects request bodies over 30 MB and base64
+  inflates the file 4/3. Downloads read `contentBytes` off the attachment entity and
+  write atomically (temp
+  file + replace), so a failed fetch can never truncate a file already staged in
+  `attachments_dir`. `outlook_list_task_attachments` paginates (`$top` + cursor) like every
+  other list tool; uploads and downloads are confined to `attachments_dir`, same as mail
+  attachments. Tool count: 62 → 70.
+
 ### Changed
+
+- **The five existing To Do tools got stricter inputs and ISO datetimes.** `outlook_list_tasks`,
+  `outlook_get_task`, `outlook_create_task`, `outlook_update_task`, `outlook_complete_task` and
+  `outlook_delete_task` (and the new detail tools) share one `list_id` resolver, and it changed
+  in ways clients can observe. An empty `list_id` string is now **rejected** instead of
+  silently falling back to the default list — clients that fill every optional string with `""`
+  were quietly targeting the default list; the error names the fix (omit the argument). An
+  explicit `list_id` is now validated as a Graph id, so a mistyped id fails locally with the
+  offending value instead of as an opaque Graph 400. The default list is resolved **once per
+  process** rather than on every call (halving the request count of a normal checklist flow);
+  only a found `defaultList` is cached — the first-list fallback re-resolves. Response
+  timestamps (`created`, `completed`, `checked_at`) are now real ISO 8601 with a `T`
+  (`2026-09-15T09:00:00+00:00`), not Python's `str(datetime)` with a space separator, so they
+  sort and parse as datetimes.
 
 - **SKILL.md installs from PyPI instead of cloning `main`.** The OpenClaw install manifest
   ran `git clone … && uv sync`, which fetches whatever is on the default branch at install
