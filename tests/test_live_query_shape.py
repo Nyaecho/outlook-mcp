@@ -42,7 +42,10 @@ from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 
 import pytest
+from msgraph.generated.models.event_type import EventType
+from msgraph.generated.models.free_busy_status import FreeBusyStatus
 
+from outlook_mcp.tools.calendar_delta import list_events_delta
 from outlook_mcp.tools.calendar_read import list_events
 from outlook_mcp.tools.contacts import list_contacts, search_contacts
 from outlook_mcp.tools.mail_read import list_inbox, search_mail
@@ -351,27 +354,67 @@ def _wide_window() -> tuple[str, str]:
     )
 
 
-async def _walk_events_for_show_as(client):
+# One walk feeds both listing tests below, for the same reason the contacts one
+# does: it costs up to five round trips and `real_graph_client` is
+# function-scoped, so the cache is module-level rather than a fixture scope.
+_EVENT_WALK: dict = {}
+
+
+def _sdk_enum_values(enum) -> set[str]:
+    """The values of an SDK enum, read off the SDK rather than typed here.
+
+    A hand-typed list beside a derived one drifts — #73's review made the point
+    about `FreeBusyStatus`, and `test_calendar_write.py` reads that same enum
+    for the same reason. Deriving both sets here means the listing guard, the
+    delta guard and the write path cannot disagree about what a valid value is,
+    and a value Microsoft adds to an enum stops being a spurious failure.
+
+    Call it once per test and keep the result: it is a fixed set, and rebuilding
+    it inside a 500-event loop says the loop depends on something it does not.
+    """
+    return {member.value for member in enum}
+
+
+async def _walk_events_for_select_fields(client):
     """Events from a wide window, so a quiet next fortnight doesn't skip this.
 
     A ±180-day window rather than the default 7: `list_events` is a calendarView
     and returns nothing at all for a caller with no upcoming meetings, which
     would let this skip forever while reading as covered — #63's page-one
     lesson, one resource over.
+
+    Harvests `show_as` and `type` in the *same* walk. They are two fields of one
+    `$select` and the failure they guard against is one failure, so a second
+    walk would double the round trips to learn the same thing. It keeps going
+    until both are populated rather than stopping at the first hit, or a
+    mailbox that answered one field would mask the other.
+
+    No assertions here: an assertion in a fixture surfaces a product regression
+    as a pytest ERROR on unrelated tests, which reads as infrastructure
+    breakage. The tests judge.
     """
     after, before = _wide_window()
-    seen, with_status, cursor = 0, [], None
+    seen, cursor = 0, None
+    with_status, with_type = [], []
     for _ in range(5):  # 500 events, bounded
         page = await list_events(client, after=after, before=before, count=100, cursor=cursor)
         seen += len(page["events"])
         with_status.extend(e for e in page["events"] if e.get("show_as"))
-        if with_status or not page["has_more"]:
+        with_type.extend(e for e in page["events"] if e.get("type"))
+        if (with_status and with_type) or not page["has_more"]:
             break
         cursor = page["cursor"]
-    return {"seen": seen, "with_status": with_status}
+    return {"seen": seen, "with_status": with_status, "with_type": with_type}
 
 
-async def test_the_event_listing_returns_the_show_as_it_selects(real_graph_client):
+@pytest.fixture
+async def event_walk(real_graph_client):
+    if not _EVENT_WALK:
+        _EVENT_WALK.update(await _walk_events_for_select_fields(real_graph_client.sdk_client))
+    return _EVENT_WALK
+
+
+async def test_the_event_listing_returns_the_show_as_it_selects(event_walk):
     """`showAs` is in `list_events`' $select, so it must come back populated.
 
     Not "the key is present" — `_format_event_summary` writes that key
@@ -379,40 +422,179 @@ async def test_the_event_listing_returns_the_show_as_it_selects(real_graph_clien
     pass against the very bug this guards. Only a non-empty value carries
     information.
 
-    This is not a hypothetical shape. The same listing's `$select` omits `type`
-    while the formatter reads it, so `type` comes back `""` on every call and
-    nothing in the mock suite can see it (issue #69). A `showAs` added to the
-    formatter and forgotten in the `$select` would have failed exactly here.
+    This was not a hypothetical shape when it was written: the same listing's
+    `$select` omitted `type` while the formatter read it, so `type` came back
+    `""` on every call and nothing in the mock suite could see it (issue #69).
+    Its sibling below is that case, now guarded the same way.
     """
-    walk = await _walk_events_for_show_as(real_graph_client.sdk_client)
-
-    if not walk["seen"]:
+    if not event_walk["seen"]:
         pytest.skip("No events in a ±180-day window — nothing to assert against")
-    if not walk["with_status"]:
+    if not event_walk["with_status"]:
         pytest.fail(
-            f"walked {walk['seen']} events and every one returned an empty show_as. "
+            f"walked {event_walk['seen']} events and every one returned an empty show_as. "
             f"Graph defaults showAs to 'busy' on every event, so this is a $select "
             f"that was not honoured, not a mailbox without the data."
         )
 
-    valid = {"free", "tentative", "busy", "oof", "workingElsewhere", "unknown"}
-    for event in walk["with_status"]:
+    valid = _sdk_enum_values(FreeBusyStatus)
+    for event in event_walk["with_status"]:
         assert event["show_as"] in valid, (
             f"Graph returned an unknown freeBusyStatus {event['show_as']!r}; "
             f"the write path's accepted set needs widening to match."
         )
 
 
-# There is deliberately no live guard for concise mode's *omission* of showAs.
-# The obvious one — assert `show_as` is absent from a live concise listing —
+async def test_the_event_listing_returns_the_type_it_selects(event_walk):
+    """Issue #69 itself: the field the `$select` never asked for.
+
+    `_format_event_summary` has read `event.type` since 1.16.0 and the listing's
+    `$select` never named it, so Graph honoured the `$select`, the SDK left the
+    attribute `None`, and every listed event reported `type: ""` — present,
+    empty, and indistinguishable from a real value. Seven releases (1.16.0
+    through 1.22.0), a CHANGELOG entry claiming the opposite, and a green
+    offline suite throughout, because a mock cannot tell an honoured `$select`
+    from an ignored one.
+
+    All-empty is a `fail`, not a `skip`: Graph assigns every event a type
+    (`singleInstance` at minimum), so there is no such thing as a mailbox whose
+    events genuinely have none. An empty walk is the only honest skip.
+
+    That `fail` is the load-bearing half. The membership check after it cannot
+    fail on this path and is kept for its error text rather than its coverage:
+    kiota maps a value outside `EventType` to `None`, `_format_event_summary`
+    renders that `""`, and `with_type` has already filtered it out — so a value
+    Microsoft invents arrives here as an absence, caught by the `fail` above.
+    The identical-looking check in the delta test *is* load-bearing: that path
+    reads raw JSON, so a new string reaches the assertion verbatim.
+
+    The values a listing can actually carry are the sibling test below.
+    """
+    if not event_walk["seen"]:
+        pytest.skip("No events in a ±180-day window — nothing to assert against")
+    if not event_walk["with_type"]:
+        pytest.fail(
+            f"walked {event_walk['seen']} events and every one returned an empty type. "
+            f"Graph assigns every event a type, so this is a $select that was not "
+            f"honoured, not a mailbox without the data — issue #69, returned."
+        )
+
+    valid = _sdk_enum_values(EventType)
+    for event in event_walk["with_type"]:
+        assert event["type"] in valid, (
+            f"Graph returned an unknown event type {event['type']!r}; the value set "
+            f"named in SKILL.md, the README and this guard needs widening to match."
+        )
+
+
+async def test_the_event_listing_never_returns_a_series_master(event_walk):
+    """`SKILL.md`, the README and the CHANGELOG tell an agent this; pin it.
+
+    `calendarView` returns expanded instances, so the discriminator on a
+    listing is `occurrence`/`exception` against `singleInstance`. An agent that
+    filters a listing for `seriesMaster` to find its recurring meetings matches
+    nothing and reports there are none — #69's silent wrong answer, one value
+    over, which is why the docs now say so and why this holds them to it.
+
+    Unlike the concise-omission guard rejected at the foot of this file, this
+    one *can* fail: `_format_event_summary` reports whatever `type` Graph
+    sends, so a master appearing on `calendarView` would carry through to the
+    key and redden here.
+
+    It is the *listing* that has this property, not calendarView-in-general.
+    `/me/calendarView/delta` is a different endpoint and does return masters,
+    which is why the test below deliberately does not forbid them. Measured
+    over one ±180-day window: the listing gave 276 `occurrence`, 206
+    `singleInstance`, 18 `exception` and no masters; the delta gave 212
+    `singleInstance`, 94 `seriesMaster` and 94 `occurrence`, three of which
+    were read back by id and confirmed as masters carrying a real recurrence.
+
+    Reuses the cached walk, so this costs no extra round trips.
+    """
+    if not event_walk["seen"]:
+        pytest.skip("No events in a ±180-day window — nothing to assert against")
+
+    # Premise: without an expanded instance in the walk this mailbox has no
+    # series in the window, and an absence of masters would prove nothing
+    # (#63's page-one lesson). Skip loudly with the tally rather than pass.
+    instances = [e for e in event_walk["with_type"] if e["type"] in {"occurrence", "exception"}]
+    if not instances:
+        pytest.skip(
+            f"walked {event_walk['seen']} events, none of them an occurrence or exception "
+            f"— no expanded series in this window, so an absence of masters says nothing"
+        )
+
+    masters = [e for e in event_walk["with_type"] if e["type"] == "seriesMaster"]
+    assert not masters, (
+        f"calendarView returned {len(masters)} seriesMaster item(s) among "
+        f"{len(event_walk['with_type'])} typed events, e.g. {masters[0]['subject']!r}, "
+        f"alongside {len(instances)} expanded instance(s). Graph has started returning "
+        f"series masters on the listing, so SKILL.md, the README and the CHANGELOG are "
+        f"now wrong to tell an agent that only `outlook_get_event` shows one."
+    )
+
+
+async def test_the_event_delta_carries_type_without_a_select(real_graph_client):
+    """The premise behind `_format_event_delta` reading `type` at all.
+
+    `/me/calendarView/delta` takes no `$select`, so the claim is that Graph
+    returns `type` regardless. That is a claim about an external service, and
+    those expire: #68's consumer-vs-work lesson is that what Graph does for one
+    account type is not what it does for another, and the same field can change
+    under you. (#70 reports exactly that happening to `isOnlineMeeting` — but
+    it is **open**, this repo's live pin still asserts the old behaviour, and
+    nothing here should be read as its ruling.) **If this test fails, Graph has
+    stopped sending `type` on the delta endpoint**, and
+    `outlook_list_events_delta` is silently reporting
+    `""` for a field `outlook_list_events` still populates — the key-set parity
+    test cannot see that, because the key would still be there.
+
+    Tombstones are excluded deliberately: `format_delta_item` short-circuits a
+    removed item to `{id, is_deleted: True}` without ever calling the
+    formatter, so counting them here would assert summary parity against a
+    shape that is exempt from it by design.
+
+    `seriesMaster` is a value this path really does carry, unlike its non-delta
+    sibling above — so nothing here forbids it, and the docs say to expect
+    master ids that a listing-seeded map never held.
+    """
+    after, before = _wide_window()
+    page = await list_events_delta(real_graph_client, start=after, end=before, page_size=100)
+
+    live = [e for e in page["events"] if not e.get("is_deleted")]
+    if not live:
+        pytest.skip(
+            f"delta returned {len(page['events'])} items in a ±180-day window, none of them "
+            f"live events — nothing to assert against"
+        )
+
+    with_type = [e for e in live if e.get("type")]
+    if not with_type:
+        pytest.fail(
+            f"walked {len(live)} live delta events and every one returned an empty type. "
+            f"The delta endpoint sends no $select, so this means Graph has stopped "
+            f"including `type` in the raw JSON — not a mailbox without the data."
+        )
+
+    valid = _sdk_enum_values(EventType)
+    for event in with_type:
+        assert event["type"] in valid, (
+            f"Graph returned an unknown event type {event['type']!r} on the delta path. "
+            f"This path reads raw JSON, so the value arrives verbatim — unlike the "
+            f"listing guard, where kiota would have turned it into an absence."
+        )
+
+
+# There is deliberately no live guard for concise mode's *omission* of showAs or
+# type. The obvious one — assert the key is absent from a live concise listing —
 # cannot fail: `_format_event_concise` builds a fixed key list that never
-# contains it, so the assertion holds whatever the `$select` asked Graph for,
+# contains either, so the assertion holds whatever the `$select` asked Graph for,
 # and would pass against the very regression it appears to guard. The honest
-# place for that contract is the `$select` itself, which is a string we send
-# and can therefore be asserted offline:
-# `test_calendar_read.py::TestShowAs::test_concise_listing_does_not_pay_for_show_as`.
+# place for that contract is the `$select` itself, which is a string we send and
+# can therefore be asserted offline — and since #69 it is asserted generally,
+# for every field, by the `event concise` row in
+# `tests/test_select_covers_the_formatter.py` rather than one field at a time.
 # Nothing is left for the live tier to see here, because an omitted field has
-# no wire behaviour for Graph to get wrong — unlike the positive case above,
+# no wire behaviour for Graph to get wrong — unlike the positive cases above,
 # where a `$select` Graph silently ignores is invisible to a mock.
 # ── todo: $expand=checklistItems on a single-task GET ──
 

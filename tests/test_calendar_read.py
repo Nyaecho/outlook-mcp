@@ -512,14 +512,16 @@ class TestEventDetailAnchorZone:
         assert named["original_start_time_zone"] != utc["original_start_time_zone"]
 
     def test_the_summary_does_not_carry_it(self):
-        """Listings are unchanged; the new key is detail-only, deliberately.
+        """Listings are unchanged; the anchor zone is detail-only, deliberately.
 
-        `_format_event_delta` in `calendar_delta` claims in its own docstring
-        to mirror `_format_event_summary` field-for-field, nothing pins that,
-        and it is already false on main — the summary carries `type` and the
-        delta does not. That is issue #69, filed separately and not fixed here.
-        Keeping the anchor zone out of the summary means this change neither
-        leans on the claim nor widens the gap.
+        When this was written the summary/delta parity claim was prose only and
+        already false, so keeping the anchor zone off the summary avoided
+        leaning on a claim nothing enforced. #69 closed that gap: the two
+        formatters now agree key-for-key and
+        `test_calendar_delta.py::…::test_both_summaries_carry_the_same_keys`
+        enforces it. So this assertion has grown a second job — add the anchor
+        zone to the summary and that parity test fails too, unless the delta
+        formatter grows it in the same commit.
         """
         assert "original_start_time_zone" not in _format_event_summary(_make_mock_event())
 
@@ -559,10 +561,19 @@ class TestEventDetailRecurrence:
     def test_missing_type_is_empty_string(self):
         assert self._detail()["type"] == ""
 
-    def test_summary_carries_type_so_listings_can_tell_series_apart(self):
-        summary = _format_event_summary(_make_mock_event(type=MagicMock(value="seriesMaster")))
+    def test_summary_carries_type_so_listings_can_tell_an_occurrence_apart(self):
+        """`occurrence`, not `seriesMaster` — which is what a listing sees.
 
-        assert summary["type"] == "seriesMaster"
+        This formatter feeds both shapes, so a master is a real value *for
+        `outlook_get_event`* (asserted above). `list_events` reads
+        `calendarView`, which returns expanded instances, so what tells
+        recurring work apart there is `occurrence`/`exception` against
+        `singleInstance`. The old name and fixture said otherwise, and an
+        agent filtering a listing for `seriesMaster` matches nothing.
+        """
+        summary = _format_event_summary(_make_mock_event(type=MagicMock(value="occurrence")))
+
+        assert summary["type"] == "occurrence"
 
     def test_summary_still_omits_the_recurrence_object(self):
         """`type` is one short string; the full pattern stays detail-only."""
@@ -571,7 +582,9 @@ class TestEventDetailRecurrence:
     def test_concise_mode_omits_type(self):
         from outlook_mcp.tools.calendar_read import _format_event_concise
 
-        concise = _format_event_concise(_make_mock_event(type=MagicMock(value="seriesMaster")))
+        # `occurrence`, like its sibling above: this formatter only ever sees a
+        # calendarView response, which never carries a master.
+        concise = _format_event_concise(_make_mock_event(type=MagicMock(value="occurrence")))
 
         assert "type" not in concise
 
@@ -617,32 +630,50 @@ class TestShowAs:
 
         assert "show_as" not in concise
 
-    async def test_list_events_asks_graph_for_show_as(self):
-        """The formatter reads it, so the $select has to ask for it.
 
-        Without this the field reads back empty forever and the caller cannot
-        tell "this event is busy" from "we never fetched the field" — #65's
-        shape, and the reason issue #69 exists one field over.
-        """
+class TestTheListingSendsTheSelectTheGuardChecks:
+    """The seam `test_select_covers_the_formatter.py` cannot see.
+
+    That guard reads `_SUMMARY_SELECT` / `_CONCISE_SELECT` off the module and
+    compares them to what the formatters read. It never calls `list_events`, so
+    it would stay green if the listing stopped sending those constants — an
+    inline literal beside them, a field appended at the call site, a branch
+    picking the wrong one. The constants would be provably consistent with the
+    formatters and provably not what Graph was asked for, which is #69 again
+    with an extra step.
+
+    Two assertions, one per mode, on the typed query-parameters object the SDK
+    actually receives. `.select` is a list because `build_request_config`
+    splits the comma form, so compare against the same split rather than
+    re-typing the field names — a hand-typed copy beside a derived one is what
+    drifts.
+
+    This replaces #73's `test_list_events_asks_graph_for_show_as` and
+    `test_concise_listing_does_not_pay_for_show_as`, which asserted one field
+    in each direction. The `_PAIRS` rows now cover every field in both
+    directions; what was left over is only this — that the constants are what
+    we send.
+    """
+
+    @staticmethod
+    async def _sent_select(**kwargs):
         mock_client = MagicMock()
         response = MagicMock(value=[], odata_next_link=None)
         mock_client.me.calendar_view.get = AsyncMock(return_value=response)
         mock_client.me.calendars = MagicMock()
 
-        await list_events(mock_client, days=1)
+        await list_events(mock_client, days=1, **kwargs)
+        return _query_params(mock_client.me.calendar_view.get).select
 
-        assert "showAs" in _query_params(mock_client.me.calendar_view.get).select
+    async def test_the_normal_listing_sends_the_summary_select(self):
+        from outlook_mcp.tools.calendar_read import _SUMMARY_SELECT
 
-    async def test_concise_listing_does_not_pay_for_show_as(self):
-        """The omission is real on the wire, not just in the formatter."""
-        mock_client = MagicMock()
-        response = MagicMock(value=[], odata_next_link=None)
-        mock_client.me.calendar_view.get = AsyncMock(return_value=response)
-        mock_client.me.calendars = MagicMock()
+        assert await self._sent_select() == _SUMMARY_SELECT.split(",")
 
-        await list_events(mock_client, days=1, concise=True)
+    async def test_the_concise_listing_sends_the_concise_select(self):
+        from outlook_mcp.tools.calendar_read import _CONCISE_SELECT
 
-        assert "showAs" not in _query_params(mock_client.me.calendar_view.get).select
+        assert await self._sent_select(concise=True) == _CONCISE_SELECT.split(",")
 
 
 class TestTimezoneResolutionReachesTheCaller:
