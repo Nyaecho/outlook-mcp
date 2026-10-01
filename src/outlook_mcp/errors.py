@@ -150,6 +150,31 @@ class UnencryptedTokenCacheError(OutlookMCPError):
         )
 
 
+class StaleConsentError(OutlookMCPError):
+    """Raised when the cached sign-in session cannot grant what we request.
+
+    A first-time consent that went through ``.default`` alone can land as a
+    signed-in session carrying no delegated permissions. Redeeming any scope
+    from it is refused with AADSTS70000 — wording that suggests signing in
+    and trying again, which is in fact the only exit, because the missing
+    consent cannot be redeemed from the session that skipped it. The remedy
+    says "log in again" in those words because the error's own text never
+    does, and every less specific remedy reads as an optional top-up.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "stale_consent",
+            "The cached sign-in session cannot serve a token for the scopes "
+            "this server requests (AADSTS70000: The requested user must first "
+            "sign-in and grant the client application access).",
+            "Log in again — run `outlook-mcp auth` on the host and complete "
+            "the sign-in. This is not an expired token: the consent was "
+            "skipped when the session was issued and cannot be redeemed from "
+            "it, so no retry or refresh will fix it.",
+        )
+
+
 class ConfigLoadError(OutlookMCPError):
     """The settings file could not be loaded; the server booted fail-safe.
 

@@ -79,7 +79,13 @@ def cmd_status() -> None:
         print("Status: authenticated (cached token valid)")
     else:
         print("Status: not authenticated")
-        print("Run: outlook-mcp auth")
+        if auth.startup_error is not None:
+            # The refresh already named its own remedy (e.g. the AADSTS70000
+            # dead end, whose only exit is a fresh login) — print it instead
+            # of the generic line, which reads as "any re-auth will do".
+            print(str(auth.startup_error))
+        else:
+            print("Run: outlook-mcp auth")
 
 
 def cmd_logout() -> None:
