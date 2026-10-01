@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 
+from azure.core.exceptions import ClientAuthenticationError
 from pydantic import ValidationError
 
 from outlook_mcp.auth import AuthManager
@@ -56,6 +57,22 @@ def cmd_auth() -> None:
         # cache refusal names the config flag and the system packages) —
         # print it, not a traceback.
         print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    except ClientAuthenticationError as exc:
+        # The sign-in itself was refused. The mode's concrete scopes make
+        # this reachable for a mis-registered app: an app registration
+        # missing one of the delegated permissions the mode asks for fails
+        # here and now, where a .default consent used to "succeed" and
+        # strand the session instead. Azure's text names the code; add the
+        # remedy it doesn't.
+        print(f"Sign-in was refused: {exc}", file=sys.stderr)
+        print(
+            "Check that the app registration carries every delegated "
+            "permission the README's registration step lists (this install "
+            f"asks for the {'read-only' if config.read_only else 'read-write'} "
+            "set), then run `outlook-mcp auth` again.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     print()
     print("Done. The MCP server will use this cached token automatically.")

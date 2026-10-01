@@ -138,3 +138,28 @@ def test_logout_removes_this_instances_record_and_says_what_stays(capsys, monkey
     assert "Microsoft.Developer.IdentityService" in out
     assert "left in place" in out
     assert "remove 'outlook-mcp'" not in out
+
+
+def test_auth_refusal_prints_the_remedy_not_a_traceback(capsys, monkeypatch):
+    """A refused first consent (e.g. an app registration missing one of the
+    mode's delegated permissions) exits 1 with the registration remedy — the
+    concrete scopes make this reachable now, where a .default consent used
+    to "succeed" and strand the session instead."""
+    from azure.core.exceptions import ClientAuthenticationError
+
+    monkeypatch.setattr(cli, "load_config", lambda: Config(client_id="test-id"))
+
+    def _refused(self):
+        raise ClientAuthenticationError(
+            "Authentication failed: AADSTS65001: the user or administrator "
+            "has not consented to use the application"
+        )
+
+    monkeypatch.setattr(cli.AuthManager, "login_interactive", _refused)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_auth()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Sign-in was refused" in err
+    assert "app registration" in err
+    assert "read-write" in err
