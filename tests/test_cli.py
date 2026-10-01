@@ -43,6 +43,35 @@ def test_status_authenticated_flow_reads_only_the_patched_record(capsys, monkeyp
     assert "outlook-mcp auth" in out
 
 
+def test_status_surfaces_a_named_remedy_instead_of_the_generic_line(
+    capsys, monkeypatch
+):
+    """The AADSTS70000 dead end must not print "Run: outlook-mcp auth" alone.
+
+    That line reads as "any re-auth will do" when only a fresh login exits,
+    so when the refresh set a startup error with its own remedy, that is
+    what status prints.
+    """
+    from unittest.mock import patch
+
+    from outlook_mcp.errors import StaleConsentError
+
+    monkeypatch.setattr(cli, "load_config", lambda: Config(client_id="test-id"))
+
+    def _dead_end_refresh(self):
+        self.startup_error = StaleConsentError()
+        return False
+
+    with patch.object(cli.AuthManager, "try_cached_token", _dead_end_refresh):
+        cli.cmd_status()
+
+    out = capsys.readouterr().out
+    assert "not authenticated" in out
+    assert "AADSTS70000" in out
+    assert "Log in again" in out
+    assert "Run: outlook-mcp auth" not in out
+
+
 def test_auth_without_config_exits_with_the_fix(capsys, monkeypatch):
     monkeypatch.setattr(cli, "load_config", lambda: Config())
     with pytest.raises(SystemExit) as exc:
