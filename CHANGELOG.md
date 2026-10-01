@@ -19,6 +19,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `outlook-mcp auth` and the client that starts the server cannot end up on different settings
   directories; a value that exists but is a file is refused with the repair.
 
+- **`outlook_update_event` can re-anchor an event into a different time zone.** Events created
+  before the anchoring fix are stored in UTC, and there was no way to repair one: the tool could
+  preserve the zone an event was already in but not change it, so a drifting series had to be
+  deleted and rebuilt, losing its id and re-inviting its attendees. `timezone` takes an IANA name
+  and requires `start` and `end` in the same call — Graph rejects a `start` patch carrying no
+  `timeZone` at all, so the zone is never an independent edit, and passing it alone is refused
+  rather than answered `updated`. One zone re-anchors both ends, which is what "move this to
+  Eastern" means; an event whose ends are in genuinely different zones keeps them by omitting the
+  argument.
+
+  Changing a **series master's** zone needs its recurrence re-sent in the same patch. Without it
+  Graph answers `400 ErrorPropertyValidationFailure`, which names neither the zone nor the
+  property; with it the identical patch succeeds. Neither rule is documented, and both were
+  established live, with the zone unchanged and a single instance as controls. The event's existing
+  recurrence is read and sent back, with `range.startDate` and `range.recurrenceTimeZone` dropped
+  so Graph re-derives them from the new anchor — echoing the stale zone back beside a new
+  `start.timeZone` produces the same opaque 400 this exists to avoid.
+
+  The pattern's days move with the anchor's local date. A US evening series stored as Thursday
+  02:00Z is Wednesday 18:00 in Los Angeles; re-deriving only `startDate` sent a Wednesday start
+  beside `daysOfWeek: ["thursday"]`, and Graph put every occurrence on Thursday, reported as
+  `updated`. Weekly days shift together (with `firstDayOfWeek`, so a fortnightly block stays one
+  block), and absolute monthly and yearly patterns take the new date's day. Where the moved series
+  has no exact expression — a relative pattern such as "the first Thursday", or a monthly one
+  pushed into the neighbouring month — the update is refused, asking for the pattern explicitly.
+
+  Handing a recurrence straight back from `outlook_get_event` while asking for a new `timezone`
+  works, including across a date boundary. That round trip returns `range.recurrenceTimeZone`, and
+  sending the old zone beside the new anchor is a pair Graph refuses — so an ordinary
+  read-modify-write became an opaque 400. The explicit argument is the more specific instruction,
+  so the stale range zone is dropped and Graph re-derives it. Without an explicit `timezone` a
+  caller-supplied range zone is still passed through untouched: it is then the only statement
+  about that zone, and discarding it would be a sanitizer removing input for no stated reason.
+  Whenever `start` is given, a supplied `range.startDate` is re-derived from it rather than refused
+  as a mismatch, and a pattern equal to the stored one moves with the start as above; a pattern
+  that differs is the caller's new instruction and is sent as given.
+
+  `timezone` is refused on an all-day event rather than ignored. Graph stores one anchored in UTC
+  whatever zone it is sent, so there is nothing to apply and silently substituting UTC would
+  report success for work not done.
+
+  Re-sending the recurrence hands back state this tool read rather than state the caller supplied,
+  so that patch is pinned to the version it read (`If-Match`). A client that re-patterns the series
+  between the read and the write now gets `412` — with a hint saying nothing was modified and to
+  re-read — instead of having its change silently reverted to the pattern this call happened to
+  see. The same pin covers every patch that reshapes a series master, because each one rests on the
+  occurrence check below: editing or deleting an occurrence moves the master's change key, so one
+  edited in another client after the check is refused rather than discarded. Every other patch is
+  still last-writer-wins: the caller supplied those values and means them. Verified live on a
+  consumer mailbox, on the SDK's own request builder.
+
+  Completes items 1 and 2 of #77. Split start/end zones on *creation* (item 3) remain deferred:
+  `outlook_create_event` still takes one `timezone`, and `outlook_update_event` preserves a split
+  it finds without being able to author one.
+
 ### Changed
 
 - **Legacy `accounts` / `default_account` config keys load with a warning instead of failing.**
@@ -45,6 +100,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Reshaping a series no longer discards its edited and deleted occurrences silently.** Graph
+  restores every changed occurrence of a series when its master's `start`, `end` or recurrence
+  changes, and reports success. Measured live with one edited and one deleted occurrence: moving
+  the start an hour in the same zone, moving only the end, re-anchoring into another zone,
+  extending the range and adding a weekday each brought both back, while a subject patch and a
+  recurrence re-sent unchanged kept them — so the loss follows the change to the series' shape,
+  and it predates `timezone`. `outlook_update_event` now reads the master's
+  `cancelledOccurrences` and `exceptionOccurrences` before any `start`, `end` or `recurrence`
+  patch to a series and refuses, naming each one that would be lost, rather than patching. It
+  fails closed: a read that omits either collection is refused rather than taken as a clean
+  series. `remove_recurrence` is unaffected — collapsing the series is what it asks for.
+  **Behaviour change:** such a patch used to succeed and quietly undo those changes; it is now
+  refused, naming what would be lost and saying to change individual occurrences instead.
+
+- **A recurrence value of the wrong JSON type is refused by name.** A `range` sent as a string, a
+  `null` interval or occurrence count, a numeric date or day name all escaped the recurrence
+  converter as `TypeError` or `AttributeError`, which reach the model as a crash with the message
+  withheld. Worse, a string where the `pattern` object belongs was *accepted*: `"type" in "daily"`
+  is a substring test, so an empty pattern was built. Each now raises an input error naming the
+  field. A fractional or boolean count (`2.5`, `true`) is refused too rather than truncated to
+  `2` or `1`. The converter is shared, so this covers `outlook_create_event`,
+  `outlook_update_event` and the To Do tools alike.
+
+- **A recurrence-only `outlook_update_event` built the series on UTC's day, not the event's.**
+  Graph returns the stored start projected into UTC and names the event's zone in Windows terms
+  ("Pacific Standard Time") for anything it was not handed an IANA name for — which Python maps to
+  nothing. So an Outlook-created event at 18:00 Pacific, stored as `02:00Z` the next day, became a
+  series on the wrong weekday, a full day late, and Graph accepted it silently. Rather than carry a
+  Windows-to-IANA table, the event is re-read with `Prefer: outlook.timezone` and Graph does the
+  projection — verified live to be honoured on the SDK's own request builder, so this adds no
+  raw-HTTP path and inherits kiota's retries. The second read happens only when the anchor cannot
+  be resolved locally; events this server creates carry IANA names and need one GET as before.
+  Graph echoes the requested zone in `start.timeZone`, so a reply in any other zone means the
+  header was not honoured, and it is refused rather than read as local time — as is a reply with
+  no start, since the only fallback is the UTC date this read exists to avoid.
+  This is item 2 of #77, and it replaces a test that pinned the wrong answer deliberately.
+
 - **Calendar events are anchored in a real time zone, so recurring series survive daylight
   saving.** `outlook_create_event` labelled every `start` and `end` with the literal
   `timeZone: "UTC"` while passing the caller's datetime through unchanged. For a single event
@@ -62,14 +154,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   anchored in `America/Los_Angeles` is Wednesday the 28th at 18:00, and taking the date off the
   text built a Thursday series starting the 29th, which Graph accepted and scheduled a day late.
 
-  `outlook_update_event` gains no argument, but stops undoing the fix: a `start`/`end` patch now
-  keeps the zone the event is already anchored in instead of stamping `UTC` on it. Graph rejects
-  a `start` patch carrying no `timeZone` at all, so one has to be sent, and the event's own is
-  the only one that does not move it. Start and end are read separately because Graph stores
-  them separately — a flight that leaves New York and lands in Los Angeles keeps both ends.
-  Re-anchoring an event into a *different* zone is deliberately not here; it is a larger change
-  than it looks (Graph refuses to move a series master's zone unless the recurrence is re-sent
-  with it) and is proposed separately.
+  `outlook_update_event` stops undoing the fix: a `start`/`end` patch keeps the zone the event is
+  already anchored in instead of stamping `UTC` on it. Graph rejects a `start` patch carrying no
+  `timeZone` at all, so one has to be sent, and the event's own is the only one that does not move
+  it. Start and end are read separately because Graph stores them separately — a flight that
+  leaves New York and lands in Los Angeles keeps both ends. Re-anchoring an event into a
+  *different* zone is the `timezone` argument in the Added section above, which shipped in the
+  same release after being developed separately.
 
   **Behaviour change.** A zone-less `start`/`end` on `outlook_create_event`
   ("2026-10-28T09:00:00") now means that wall-clock time in the configured zone, where it

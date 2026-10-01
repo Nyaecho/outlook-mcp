@@ -51,6 +51,45 @@ _SHORTHANDS = ("daily", "weekdays", "weekly", "monthly", "yearly")
 _OVERLONG_FRACTION = re.compile(r"(\.\d{6})\d+")
 
 
+def _object(value: Any, label: str) -> dict:
+    """``value`` as a JSON object, or a refusal naming ``label``.
+
+    ``None`` reads as absent. Anything else that is not a dict is refused rather
+    than probed: ``"type" in "daily"`` is a substring test, so a string where an
+    object belongs would otherwise build an empty pattern without complaint.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"recurrence {label} must be an object; got {type(value).__name__}")
+    return value
+
+
+def _integer(value: Any, label: str) -> int:
+    """``value`` as a whole number, or a refusal naming ``label``.
+
+    A digit string is accepted, as it always was. A bool or a fractional float
+    is refused rather than coerced: ``int(True)`` is 1 and ``int(2.5)`` is 2, and
+    silently reinterpreting what the caller asked for is worse than saying so.
+    """
+    refusal = ValueError(f"recurrence {label} must be a whole number; got {value!r:.50}")
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise refusal
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise refusal from e
+
+
+def _iso_date(value: Any, label: str) -> date:
+    if not isinstance(value, str):
+        raise ValueError(f"recurrence {label} must be a YYYY-MM-DD string; got {value!r:.50}")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as e:
+        raise ValueError(f"recurrence {label} must be YYYY-MM-DD; got {value[:50]!r}") from e
+
+
 def build_patterned_recurrence(recurrence: dict) -> Any:
     """Convert a Graph JSON-shape recurrence dict into a typed PatternedRecurrence.
 
@@ -71,12 +110,15 @@ def build_patterned_recurrence(recurrence: dict) -> Any:
     if not isinstance(recurrence, dict):
         raise ValueError("recurrence must be a dict with 'pattern' and 'range' keys")
 
-    pattern_in = recurrence.get("pattern") or {}
-    range_in = recurrence.get("range") or {}
+    pattern_in = _object(recurrence.get("pattern"), "pattern")
+    range_in = _object(recurrence.get("range"), "range")
     if not pattern_in or not range_in:
         raise ValueError("recurrence must include both 'pattern' and 'range'")
 
     def _enum_lookup(enum_cls: Any, value: str, label: str) -> Any:
+        valid = [m.value for m in enum_cls]
+        if not isinstance(value, str):
+            raise ValueError(f"Invalid {label} {value!r:.50}. Must be one of: {valid}")
         # SDK enum members are PascalCase; Graph JSON uses camelCase
         try:
             return enum_cls(value)
@@ -85,19 +127,23 @@ def build_patterned_recurrence(recurrence: dict) -> Any:
             try:
                 return enum_cls[target]
             except KeyError as e:
-                valid = [m.value for m in enum_cls]
                 raise ValueError(f"Invalid {label} '{value}'. Must be one of: {valid}") from e
 
     pattern = RecurrencePattern()
     if "type" in pattern_in:
         pattern.type = _enum_lookup(RecurrencePatternType, pattern_in["type"], "pattern.type")
     if "interval" in pattern_in:
-        pattern.interval = int(pattern_in["interval"])
+        pattern.interval = _integer(pattern_in["interval"], "pattern.interval")
     if "month" in pattern_in:
-        pattern.month = int(pattern_in["month"])
+        pattern.month = _integer(pattern_in["month"], "pattern.month")
     if "dayOfMonth" in pattern_in:
-        pattern.day_of_month = int(pattern_in["dayOfMonth"])
+        pattern.day_of_month = _integer(pattern_in["dayOfMonth"], "pattern.dayOfMonth")
     if "daysOfWeek" in pattern_in:
+        if not isinstance(pattern_in["daysOfWeek"], list):
+            raise ValueError(
+                "recurrence pattern.daysOfWeek must be a list of day names, "
+                'e.g. ["monday"]'
+            )
         pattern.days_of_week = [
             _enum_lookup(DayOfWeek, d, "pattern.daysOfWeek") for d in pattern_in["daysOfWeek"]
         ]
@@ -112,12 +158,16 @@ def build_patterned_recurrence(recurrence: dict) -> Any:
     if "type" in range_in:
         rng.type = _enum_lookup(RecurrenceRangeType, range_in["type"], "range.type")
     if "startDate" in range_in:
-        rng.start_date = date.fromisoformat(range_in["startDate"])
+        rng.start_date = _iso_date(range_in["startDate"], "range.startDate")
     if "endDate" in range_in:
-        rng.end_date = date.fromisoformat(range_in["endDate"])
+        rng.end_date = _iso_date(range_in["endDate"], "range.endDate")
     if "numberOfOccurrences" in range_in:
-        rng.number_of_occurrences = int(range_in["numberOfOccurrences"])
+        rng.number_of_occurrences = _integer(
+            range_in["numberOfOccurrences"], "range.numberOfOccurrences"
+        )
     if "recurrenceTimeZone" in range_in:
+        if not isinstance(range_in["recurrenceTimeZone"], str):
+            raise ValueError("recurrence range.recurrenceTimeZone must be a zone name string")
         rng.recurrence_time_zone = range_in["recurrenceTimeZone"]
 
     pr = PatternedRecurrence()
@@ -231,7 +281,7 @@ def _reconcile_range(payload: dict, start: date) -> dict:
     default it; when they do send one, a mismatch is a mistake worth naming
     here rather than surfacing as an opaque 400.
     """
-    rng = dict(payload.get("range") or {})
+    rng = dict(_object(payload.get("range"), "range"))
     rng.setdefault("type", "noEnd")
 
     given = rng.get("startDate")
@@ -257,7 +307,193 @@ def _reconcile_range(payload: dict, start: date) -> dict:
     return {**payload, "range": rng}
 
 
-def build_event_recurrence(recurrence: dict | str, *, start: str, zone: str | None = None) -> Any:
+def event_recurrence_payload(recurrence: dict | str, start_date: date) -> dict:
+    """Any accepted recurrence shape, as the Graph JSON object it stands for.
+
+    A dict is copied, a JSON string decoded, and a shorthand expanded against
+    ``start_date``. Nothing is reconciled yet — that is ``build_event_recurrence``'s
+    job — so a caller can adjust the payload in between.
+    """
+    if isinstance(recurrence, dict):
+        return dict(recurrence)
+    if not isinstance(recurrence, str):
+        raise ValueError(
+            "recurrence must be a Graph recurrence object, a JSON string of one, "
+            f"or one of: {list(_SHORTHANDS)}"
+        )
+    text = recurrence.strip()
+    if not text.startswith(("{", "[")):
+        return _expand_shorthand(text, start_date)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"recurrence is not valid JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ValueError("recurrence JSON must be an object with 'pattern' and 'range' keys")
+    return parsed
+
+
+def check_recurrence_shape(recurrence: dict | str) -> None:
+    """Refuse a malformed recurrence without needing the event's start.
+
+    Everything except ``range.startDate`` can be checked before a single read:
+    the JSON, the shorthand name, both sections present, every enum and date.
+    ``startDate`` is left to ``build_event_recurrence``, which is the only place
+    that knows the date it has to match. A shorthand is expanded against an
+    arbitrary date here, since only the shape is kept.
+    """
+    payload = event_recurrence_payload(recurrence, date(2000, 1, 3))
+    rng = {k: v for k, v in _object(payload.get("range"), "range").items() if k != "startDate"}
+    rng.setdefault("type", "noEnd")
+    build_patterned_recurrence({**payload, "range": rng})
+
+
+def _pattern_type(pattern: dict) -> str:
+    """The pattern's type in Graph's own spelling, however the caller cased it.
+
+    The converter accepts both `weekly` and `Weekly` (the SDK's member name), so
+    anything that branches on the type has to see one spelling, or a PascalCase
+    pattern skips every type-specific comparison and move.
+    """
+    from msgraph.generated.models.recurrence_pattern_type import RecurrencePatternType
+
+    raw = str(pattern.get("type") or "")
+    for member in RecurrencePatternType:
+        if member.value.lower() == raw.lower():
+            return member.value
+    return raw
+
+
+def _whole(pattern: dict, field: str) -> int | None:
+    """``pattern[field]`` read the way the converter reads it, or ``None`` if absent.
+
+    The converter accepts ``"15"`` for 15, so a comparison or a move that took the
+    raw value would call an echoed ``"15"`` a different day from the stored 15.
+    """
+    value = pattern.get(field)
+    return None if value is None else _integer(value, f"pattern.{field}")
+
+
+def _pattern_key(pattern: Any) -> tuple | None:
+    """The fields that decide which days a pattern lands on, for comparison.
+
+    Graph fills in defaults on read — a weekly pattern comes back carrying
+    ``month: 0``, ``dayOfMonth: 0`` and ``index: "first"`` — so comparing whole
+    dicts would call a hand-written pattern different from the stored one it
+    describes. Only the fields the pattern's type actually reads take part.
+    """
+    if not isinstance(pattern, dict) or not pattern.get("type"):
+        return None
+    kind = _pattern_type(pattern)
+    key: tuple = (kind, _whole(pattern, "interval") or 1)
+    if kind in ("weekly", "relativeMonthly", "relativeYearly"):
+        key += (frozenset(str(d).lower() for d in pattern.get("daysOfWeek") or ()),)
+    if kind == "weekly" and key[1] > 1:
+        # Only a multi-week interval reads the week boundary: it decides which
+        # days share a week, so moving it reshapes a fortnightly Sunday-and-Monday
+        # series. Every week, it changes nothing, and counting it would call an
+        # echo that dropped the field an edit. Graph's default is Sunday.
+        key += (str(pattern.get("firstDayOfWeek") or "sunday").lower(),)
+    if kind in ("absoluteMonthly", "absoluteYearly"):
+        key += (_whole(pattern, "dayOfMonth"),)
+    if kind in ("absoluteYearly", "relativeYearly"):
+        key += (_whole(pattern, "month"),)
+    if kind in ("relativeMonthly", "relativeYearly"):
+        key += (str(pattern.get("index") or "first").lower(),)
+    return key
+
+
+def same_pattern(a: Any, b: Any) -> bool:
+    """Whether two Graph patterns schedule the same days."""
+    key = _pattern_key(a)
+    return key is not None and key == _pattern_key(b)
+
+
+def _refuse_move(kind: str, old: date, new: date, why: str) -> ValueError:
+    return ValueError(
+        f"This series' {kind} pattern was set up for a series starting "
+        f"{old.isoformat()}, and the new start falls on {new.isoformat()} in the "
+        f"event's zone. {why} Pass `recurrence` with the pattern you want alongside "
+        f"`start`, and it is sent as given."
+    )
+
+
+def move_pattern(payload: dict, *, old: date, new: date) -> dict:
+    """``payload``'s pattern moved from a series starting ``old`` to one starting ``new``.
+
+    A series' pattern names days — ``daysOfWeek``, ``dayOfMonth`` — and those
+    days belong to its start date. Re-deriving ``range.startDate`` alone moves
+    the range and leaves the pattern behind: a Thursday 02:00Z series
+    re-anchored to Los Angeles starts on Wednesday at 18:00 but still says
+    ``daysOfWeek: ["thursday"]``, and Graph schedules every occurrence on
+    Thursday. Verified live — reported as ``updated``, every instance a day late.
+
+    So the pattern moves by the same number of days the start did. Weekly days
+    shift together, and ``firstDayOfWeek`` with them, so a fortnightly
+    Sunday-and-Monday series stays one block rather than being split across
+    the week boundary. Absolute patterns take the new date's day (and month,
+    for yearly), provided the stored pattern was anchored on the old one.
+
+    Refused, rather than approximated, where the moved series has no exact
+    expression: a relative pattern ("the first Thursday") whose day moves, and a
+    monthly one pushed into a neighbouring month — the day before "the 1st" is
+    not any one ``dayOfMonth``.
+    """
+    delta = (new - old).days
+    pattern = dict(payload.get("pattern") or {})
+    kind = _pattern_type(pattern)
+    if delta == 0 or kind == "daily":
+        return payload
+
+    if kind == "weekly":
+
+        def shifted(day: Any) -> str:
+            return _WEEKDAYS[(_WEEKDAYS.index(str(day).lower()) + delta) % 7]
+
+        pattern["daysOfWeek"] = [shifted(d) for d in pattern.get("daysOfWeek") or ()]
+        if pattern.get("firstDayOfWeek"):
+            pattern["firstDayOfWeek"] = shifted(pattern["firstDayOfWeek"])
+    elif kind in ("absoluteMonthly", "absoluteYearly"):
+        anchored = _whole(pattern, "dayOfMonth") == old.day and (
+            kind == "absoluteMonthly" or _whole(pattern, "month") == old.month
+        )
+        if not anchored:
+            raise _refuse_move(
+                kind,
+                old,
+                new,
+                "Its day does not match that start date, so there is no telling what "
+                "moving it should mean.",
+            )
+        if kind == "absoluteMonthly" and (new.year, new.month) != (old.year, old.month):
+            raise _refuse_move(
+                kind,
+                old,
+                new,
+                "That crosses into a different month, which no single dayOfMonth "
+                "expresses.",
+            )
+        pattern["dayOfMonth"] = new.day
+        if kind == "absoluteYearly":
+            pattern["month"] = new.month
+    else:
+        raise _refuse_move(
+            kind or "unknown",
+            old,
+            new,
+            "A relative pattern cannot be moved by a day and stay exact: the day "
+            "before the first Thursday is not always the first Wednesday.",
+        )
+    return {**payload, "pattern": pattern}
+
+
+def build_event_recurrence(
+    recurrence: dict | str,
+    *,
+    start: str,
+    zone: str | None = None,
+    drop_range_timezone: bool = False,
+) -> Any:
     """Build a typed PatternedRecurrence for a calendar event.
 
     Accepts the Graph recurrence object, a JSON-encoded string of one, or a
@@ -270,7 +506,20 @@ def build_event_recurrence(recurrence: dict | str, *, start: str, zone: str | No
     which is right only while the two agree; see ``event_start_date`` for the
     case where they do not.
 
-    ``range.recurrenceTimeZone`` is passed through rather than stripped, and
+    ``drop_range_timezone`` removes ``range.recurrenceTimeZone`` from the
+    payload. Set it when the caller has named the event's zone by another route
+    — an explicit ``timezone`` on ``update_event`` — because the two then
+    describe the same thing and Graph refuses the pair when they disagree. The
+    read-modify-write round trip makes that collision ordinary rather than
+    exotic: ``outlook_get_event`` hands back ``recurrenceTimeZone``, so a caller
+    echoing a recurrence while asking for a new zone sends the old zone with it.
+    Graph re-derives the range's zone from the event's own when the field is
+    absent, so dropping it is lossless.
+
+    Off by default, because the general passthrough below is deliberate; this
+    resolves one specific conflict rather than reversing that decision.
+
+    ``range.recurrenceTimeZone`` is otherwise passed through rather than stripped, and
     that is a decision, not an oversight. Graph derives the range's zone from
     the event's own when the field is absent, so supplying one can only agree
     (redundant) or disagree — and a disagreement is refused outright with
@@ -285,29 +534,17 @@ def build_event_recurrence(recurrence: dict | str, *, start: str, zone: str | No
     (``errors._HINT_TABLE``).
     """
     start_date = event_start_date(start, zone)
+    payload = event_recurrence_payload(recurrence, start_date)
 
-    if isinstance(recurrence, str):
-        text = recurrence.strip()
-        if text.startswith(("{", "[")):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"recurrence is not valid JSON: {e}") from e
-            if not isinstance(parsed, dict):
-                raise ValueError(
-                    "recurrence JSON must be an object with 'pattern' and 'range' keys"
-                )
-            payload = parsed
-        else:
-            payload = _expand_shorthand(text, start_date)
-    elif isinstance(recurrence, dict):
-        payload = dict(recurrence)
-    else:
-        raise ValueError(
-            "recurrence must be a Graph recurrence object, a JSON string of one, "
-            f"or one of: {list(_SHORTHANDS)}"
-        )
-
+    if drop_range_timezone and payload.get("range"):
+        payload = {
+            **payload,
+            "range": {
+                k: v
+                for k, v in _object(payload["range"], "range").items()
+                if k != "recurrenceTimeZone"
+            },
+        }
     return build_patterned_recurrence(_reconcile_range(payload, start_date))
 
 

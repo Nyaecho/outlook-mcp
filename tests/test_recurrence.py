@@ -264,3 +264,276 @@ class TestEventStartDate:
         assert event_start_date("2026-10-29T01:00:00Z", "Pacific Standard Time") == date(
             2026, 10, 29
         )
+
+
+class TestMovePattern:
+    """A series' pattern names days, and those days belong to its start date.
+
+    When the start's local date moves — a re-anchor across midnight, or a series
+    moved to another day — the pattern has to move with it, or Graph schedules
+    every occurrence on the old day beside a master on the new one.
+    """
+
+    @staticmethod
+    def _move(pattern: dict, old: date, new: date) -> dict:
+        from outlook_mcp.tools._recurrence import move_pattern
+
+        return move_pattern({"pattern": pattern, "range": {"type": "noEnd"}}, old=old, new=new)[
+            "pattern"
+        ]
+
+    def test_weekly_days_move_together_with_the_week_boundary(self):
+        """A fortnightly Sunday-and-Monday block stays one block a day earlier.
+
+        Shifting the days and leaving `firstDayOfWeek` on Sunday would split
+        Saturday and Sunday across two weeks of the fortnight.
+        """
+        moved = self._move(
+            {
+                "type": "weekly",
+                "interval": 2,
+                "daysOfWeek": ["sunday", "monday"],
+                "firstDayOfWeek": "sunday",
+            },
+            old=date(2026, 11, 8),
+            new=date(2026, 11, 7),
+        )
+        assert moved["daysOfWeek"] == ["saturday", "sunday"]
+        assert moved["firstDayOfWeek"] == "saturday"
+
+    def test_weekly_wraps_forward_across_the_week(self):
+        moved = self._move(
+            {"type": "weekly", "interval": 1, "daysOfWeek": ["saturday"]},
+            old=date(2026, 11, 7),
+            new=date(2026, 11, 8),
+        )
+        assert moved["daysOfWeek"] == ["sunday"]
+
+    def test_an_unmoved_date_changes_nothing(self):
+        pattern = {"type": "absoluteMonthly", "interval": 1, "dayOfMonth": 1}
+        assert self._move(pattern, old=date(2026, 11, 1), new=date(2026, 11, 1)) == pattern
+
+    def test_daily_has_no_days_to_move(self):
+        pattern = {"type": "daily", "interval": 1}
+        assert self._move(pattern, old=date(2026, 11, 5), new=date(2026, 11, 4)) == pattern
+
+    def test_monthly_takes_the_new_day_within_the_month(self):
+        moved = self._move(
+            {"type": "absoluteMonthly", "interval": 1, "dayOfMonth": 15},
+            old=date(2026, 11, 15),
+            new=date(2026, 11, 14),
+        )
+        assert moved["dayOfMonth"] == 14
+
+    def test_monthly_pushed_into_another_month_is_refused(self):
+        """The day before "the 1st" is not any single dayOfMonth."""
+        with pytest.raises(ValueError, match="different month"):
+            self._move(
+                {"type": "absoluteMonthly", "interval": 1, "dayOfMonth": 1},
+                old=date(2026, 12, 1),
+                new=date(2026, 11, 30),
+            )
+
+    def test_yearly_takes_the_new_month_and_day(self):
+        moved = self._move(
+            {"type": "absoluteYearly", "interval": 1, "month": 1, "dayOfMonth": 1},
+            old=date(2027, 1, 1),
+            new=date(2026, 12, 31),
+        )
+        assert (moved["month"], moved["dayOfMonth"]) == (12, 31)
+
+    def test_an_absolute_pattern_not_anchored_on_its_start_is_refused(self):
+        with pytest.raises(ValueError, match="does not match that start date"):
+            self._move(
+                {"type": "absoluteMonthly", "interval": 1, "dayOfMonth": 20},
+                old=date(2026, 11, 15),
+                new=date(2026, 11, 14),
+            )
+
+    def test_a_relative_pattern_whose_day_moves_is_refused(self):
+        """The day before the first Thursday is not always the first Wednesday."""
+        with pytest.raises(ValueError, match="relative pattern"):
+            self._move(
+                {
+                    "type": "relativeMonthly",
+                    "interval": 1,
+                    "daysOfWeek": ["thursday"],
+                    "index": "first",
+                },
+                old=date(2026, 11, 5),
+                new=date(2026, 11, 4),
+            )
+
+
+class TestSamePattern:
+    def test_graph_defaults_do_not_make_a_pattern_different(self):
+        """Graph fills in `month: 0`, `dayOfMonth: 0` and `index` on a weekly read.
+
+        A hand-written pattern describing the same days is the same pattern;
+        comparing whole dicts would call it an edit and skip moving it.
+        """
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        read_back = {
+            "type": "weekly",
+            "interval": 1,
+            "month": 0,
+            "dayOfMonth": 0,
+            "daysOfWeek": ["thursday"],
+            "firstDayOfWeek": "sunday",
+            "index": "first",
+        }
+        assert same_pattern({"type": "weekly", "daysOfWeek": ["Thursday"]}, read_back)
+
+    def test_a_different_day_is_a_different_pattern(self):
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        assert not same_pattern(
+            {"type": "weekly", "daysOfWeek": ["monday"]},
+            {"type": "weekly", "daysOfWeek": ["thursday"]},
+        )
+
+    def test_nothing_is_the_same_as_nothing(self):
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        assert not same_pattern(None, None)
+
+    def test_a_moved_week_boundary_is_a_different_fortnightly_pattern(self):
+        """Every other week, `firstDayOfWeek` decides which days share a week.
+
+        A caller who changed only the boundary has written a new schedule, so it
+        must not be taken for the stored one and shifted a second time.
+        """
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        base = {"type": "weekly", "interval": 2, "daysOfWeek": ["sunday", "monday"]}
+        assert not same_pattern(
+            {**base, "firstDayOfWeek": "monday"}, {**base, "firstDayOfWeek": "sunday"}
+        )
+        # Graph's default is Sunday, so omitting it is the same boundary.
+        assert same_pattern(base, {**base, "firstDayOfWeek": "sunday"})
+
+    def test_the_week_boundary_does_not_matter_every_week(self):
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        base = {"type": "weekly", "interval": 1, "daysOfWeek": ["thursday"]}
+        assert same_pattern({**base, "firstDayOfWeek": "monday"}, base)
+
+
+_WRONG_TYPES = [
+    ({"pattern": {"type": "daily"}, "range": "invalid"}, "range must be an object"),
+    ({"pattern": {"type": "daily"}, "range": ["noEnd"]}, "range must be an object"),
+    ({"pattern": "daily", "range": {"type": "noEnd"}}, "pattern must be an object"),
+    ({"pattern": {"type": "daily", "interval": None}, "range": {"type": "noEnd"}},
+     "pattern.interval must be a whole number"),
+    ({"pattern": {"type": "daily", "interval": 2.5}, "range": {"type": "noEnd"}},
+     "pattern.interval must be a whole number"),
+    ({"pattern": {"type": "daily", "interval": True}, "range": {"type": "noEnd"}},
+     "pattern.interval must be a whole number"),
+    ({"pattern": {"type": "weekly", "daysOfWeek": "monday"}, "range": {"type": "noEnd"}},
+     "daysOfWeek must be a list"),
+    ({"pattern": {"type": "weekly", "daysOfWeek": [1]}, "range": {"type": "noEnd"}},
+     "Invalid pattern.daysOfWeek 1"),
+    ({"pattern": {"type": 7}, "range": {"type": "noEnd"}}, "Invalid pattern.type 7"),
+    ({"pattern": {"type": "daily"}, "range": {"type": "numbered", "numberOfOccurrences": None}},
+     "numberOfOccurrences must be a whole number"),
+    ({"pattern": {"type": "daily"}, "range": {"type": "endDate", "endDate": 20270101}},
+     "endDate must be a YYYY-MM-DD string"),
+    ({"pattern": {"type": "daily"}, "range": {"type": "noEnd", "recurrenceTimeZone": 5}},
+     "recurrenceTimeZone must be a zone name string"),
+]
+
+
+class TestWrongJsonTypesAreRefusedByName:
+    """A value of the wrong JSON type is caller input, so it gets an input error.
+
+    These used to escape as `TypeError` / `AttributeError`, which the server
+    reports as a crash with the message withheld — or, for a string where the
+    pattern object belongs, were accepted: `"type" in "daily"` is a substring
+    test, so the converter built an empty pattern without complaint.
+    """
+
+    @pytest.mark.parametrize("recurrence,message", _WRONG_TYPES)
+    def test_the_converter_names_the_field(self, recurrence, message):
+        with pytest.raises(ValueError, match=message):
+            build_event_recurrence(recurrence, start=_START)
+
+    @pytest.mark.parametrize("recurrence,message", _WRONG_TYPES)
+    def test_the_up_front_shape_check_names_it_too(self, recurrence, message):
+        from outlook_mcp.tools._recurrence import check_recurrence_shape
+
+        with pytest.raises(ValueError, match=message):
+            check_recurrence_shape(recurrence)
+
+
+class TestPatternTypeSpelling:
+    """The converter accepts `weekly` and the SDK's `Weekly`; comparison and moves must too.
+
+    Seen case-sensitively, a `Weekly` pattern skipped every type-specific field,
+    so an edited Monday pattern compared equal to a stored Thursday one and was
+    shifted as if it were the series' own.
+    """
+
+    def test_a_pascal_case_pattern_on_a_different_day_is_a_different_pattern(self):
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        assert not same_pattern(
+            {"type": "Weekly", "daysOfWeek": ["monday"]},
+            {"type": "weekly", "interval": 1, "daysOfWeek": ["thursday"]},
+        )
+
+    def test_a_pascal_case_echo_is_the_same_pattern(self):
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        assert same_pattern(
+            {"type": "Weekly", "daysOfWeek": ["thursday"]},
+            {"type": "weekly", "interval": 1, "daysOfWeek": ["thursday"]},
+        )
+
+    def test_a_pascal_case_pattern_moves_like_any_other(self):
+        from outlook_mcp.tools._recurrence import move_pattern
+
+        moved = move_pattern(
+            {"pattern": {"type": "Weekly", "daysOfWeek": ["thursday"]}, "range": {}},
+            old=date(2026, 11, 5),
+            new=date(2026, 11, 4),
+        )
+        assert moved["pattern"]["daysOfWeek"] == ["wednesday"]
+
+
+def test_a_whole_number_in_another_spelling_is_still_accepted():
+    """The control: a digit string and an integral float were accepted before, and still are."""
+    built = build_event_recurrence(
+        {"pattern": {"type": "daily", "interval": "2"},
+         "range": {"type": "numbered", "numberOfOccurrences": 3.0}},
+        start=_START,
+    )
+    assert built.pattern.interval == 2
+    assert built.range.number_of_occurrences == 3
+
+
+class TestNumbersInAnotherSpelling:
+    """The converter reads `"15"` as 15, so comparison and moves have to as well.
+
+    Compared raw, an echoed monthly pattern carrying `"15"` was taken for an edit
+    of the stored 15 and sent unmoved across a date boundary, and a move of it
+    was refused as not anchored on its own start.
+    """
+
+    def test_a_string_day_is_the_same_day(self):
+        from outlook_mcp.tools._recurrence import same_pattern
+
+        assert same_pattern(
+            {"type": "absoluteMonthly", "interval": "1", "dayOfMonth": "15"},
+            {"type": "absoluteMonthly", "interval": 1, "dayOfMonth": 15},
+        )
+
+    def test_a_string_day_moves(self):
+        from outlook_mcp.tools._recurrence import move_pattern
+
+        moved = move_pattern(
+            {"pattern": {"type": "absoluteMonthly", "dayOfMonth": "15"}, "range": {}},
+            old=date(2026, 11, 15),
+            new=date(2026, 11, 14),
+        )
+        assert moved["pattern"]["dayOfMonth"] == 14
