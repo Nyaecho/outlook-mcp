@@ -46,8 +46,10 @@ def cmd_auth() -> None:
         sys.exit(1)
 
     auth = AuthManager(config)
-    mode = "read-only" if config.read_only else "read-write"
-    print(f"Authenticating with {mode} scopes...")
+    # Always the read-write set, whatever read_only says: that flag gates the
+    # tools, not the token, and a read-only first consent could never be
+    # widened once the config flips.
+    print("Authenticating with the read-write scopes...")
     print()
 
     try:
@@ -59,18 +61,16 @@ def cmd_auth() -> None:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
     except ClientAuthenticationError as exc:
-        # The sign-in itself was refused. The mode's concrete scopes make
-        # this reachable for a mis-registered app: an app registration
-        # missing one of the delegated permissions the mode asks for fails
-        # here and now, where a .default consent used to "succeed" and
-        # strand the session instead. Azure's text names the code; add the
-        # remedy it doesn't.
+        # The sign-in itself was refused. The concrete scopes make this
+        # reachable for a mis-registered app: an app registration missing
+        # one of the delegated permissions asks for fails here and now,
+        # where a .default consent used to "succeed" and strand the session
+        # instead. Azure's text names the code; add the remedy it doesn't.
         print(f"Sign-in was refused: {exc}", file=sys.stderr)
         print(
             "Check that the app registration carries every delegated "
-            "permission the README's registration step lists (this install "
-            f"asks for the {'read-only' if config.read_only else 'read-write'} "
-            "set), then run `outlook-mcp auth` again.",
+            "permission the README's registration step lists, then run "
+            "`outlook-mcp auth` again.",
             file=sys.stderr,
         )
         sys.exit(1)

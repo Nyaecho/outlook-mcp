@@ -142,7 +142,7 @@ def test_logout_removes_this_instances_record_and_says_what_stays(capsys, monkey
 
 def test_auth_refusal_prints_the_remedy_not_a_traceback(capsys, monkeypatch):
     """A refused first consent (e.g. an app registration missing one of the
-    mode's delegated permissions) exits 1 with the registration remedy — the
+    delegated permissions) exits 1 with the registration remedy — the
     concrete scopes make this reachable now, where a .default consent used
     to "succeed" and strand the session instead."""
     from azure.core.exceptions import ClientAuthenticationError
@@ -162,4 +162,3 @@ def test_auth_refusal_prints_the_remedy_not_a_traceback(capsys, monkeypatch):
     err = capsys.readouterr().err
     assert "Sign-in was refused" in err
     assert "app registration" in err
-    assert "read-write" in err

@@ -29,25 +29,21 @@ logger = logging.getLogger(__name__)
 # and try_cached_token, often multiple times during startup.
 _warned_unencrypted_fallback = False
 
-# The concrete delegated scopes each mode needs. The FIRST consent asks for
-# exactly these (login_interactive); every request afterwards — silent refresh
-# and the Graph SDK's internal calls alike — uses .default, which on an
-# already-consented session means precisely "the consented set". MSAL adds
-# offline_access to its token requests itself, so it is deliberately absent.
+# The concrete delegated scopes the first consent asks for — always the full
+# read-write set, whatever read_only says: read_only gates the tools, not the
+# token (#58), and the scopes a first consent omits can never be redeemed from
+# the session it creates, so a read-only consent could never be widened after
+# the config flips. The FIRST consent names exactly these (login_interactive);
+# every request afterwards — silent refresh and the Graph SDK's internal calls
+# alike — uses .default, which on an already-consented session means precisely
+# "the consented set". MSAL adds offline_access to its token requests itself,
+# so it is deliberately absent.
 SCOPES_READWRITE = [
     "Mail.ReadWrite",
     "Mail.Send",
     "Calendars.ReadWrite",
     "Contacts.ReadWrite",
     "Tasks.ReadWrite",
-    "User.Read",
-]
-
-SCOPES_READONLY = [
-    "Mail.Read",
-    "Calendars.Read",
-    "Contacts.Read",
-    "Tasks.Read",
     "User.Read",
 ]
 
@@ -177,13 +173,17 @@ class AuthManager:
         self.startup_error: OutlookMCPError | None = None
 
     def get_scopes(self) -> list[str]:
-        """Return the concrete delegated scopes the configured mode needs.
+        """Return the concrete delegated scopes the first consent asks for.
 
-        ``login_interactive`` consents exactly these: which list this returns
-        decides what the account is ever able to grant, because the scopes a
-        first consent omits cannot be redeemed from the session it creates.
+        Always the full read-write set, whatever ``read_only`` says: that flag
+        gates the tools, not the token (#58). Which list this returns decides
+        what the account is ever able to grant — the scopes a first consent
+        omits cannot be redeemed from the session it creates, and because
+        every later request renews via ``.default`` ("the consented set"), a
+        read-only first consent could never be widened once the config flips
+        to ``read_only: false``. So the consent is always asked wide.
         """
-        return SCOPES_READONLY if self.config.read_only else SCOPES_READWRITE
+        return SCOPES_READWRITE
 
     def is_authenticated(self) -> bool:
         """Check if we have an active credential."""
@@ -284,7 +284,9 @@ class AuthManager:
         # land a session with no delegated permissions, and no scope can be
         # redeemed from it afterwards (AADSTS70000) — only logging in again
         # fixes that. Once these scopes are consented, everything later uses
-        # .default, which then means exactly this consented set.
+        # .default, which then means exactly this consented set. The list is
+        # the read-write one whatever read_only says (see get_scopes): that
+        # flag gates the tools, not the token.
         try:
             cred.get_token(*self.get_scopes())
         except ClientAuthenticationError as exc:

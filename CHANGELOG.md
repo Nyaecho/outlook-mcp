@@ -14,8 +14,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   no delegated permissions — and no scope can be redeemed from that session afterwards
   (AADSTS70000: "The requested user must first sign-in and grant the client application
   access"), so the account is stuck until someone logs in again. `outlook-mcp auth` now
-  asks for exactly the scopes the configured mode needs — the read-write or read-only
-  list the config already knows — and silent refresh keeps using `.default`, which on an
+  asks for the full read-write set whatever the config's `read_only` flag says — that
+  flag gates the tools, not the token, and a read-only first consent could never be
+  widened once the flag flips — and silent refresh keeps using `.default`, which on an
   already-consented session means precisely "the consented set", and is the only thing a
   session consented through `.default` alone can still redeem, so records saved before
   this change keep refreshing. When a refresh does fail with AADSTS70000, the remedy — on
