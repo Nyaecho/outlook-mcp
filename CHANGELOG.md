@@ -69,6 +69,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   for the literal text `ZoÃ«` are UTF-8 for `Zoë`. A UTF-8-only reader would read them identically.
   Plain accented text such as `Zoë` in cp1252 is not valid UTF-8, so it does reach the fallback.
 
+- **First-time sign-in consents the concrete delegated scopes, not `.default`.** On a
+  personal (MSA) account, a first device-code consent asking only for
+  `https://graph.microsoft.com/.default` can land a session that authenticates but carries
+  no delegated permissions — and no scope can be redeemed from that session afterwards
+  (AADSTS70000: "The requested user must first sign-in and grant the client application
+  access"), so the account is stuck until someone logs in again. `outlook-mcp auth` now
+  asks for the full read-write set whatever the config's `read_only` flag says — that
+  flag gates the tools, not the token, and a read-only first consent could never be
+  widened once the flag flips — and silent refresh keeps using `.default`, which on an
+  already-consented session means precisely "the consented set", and is the only thing a
+  session consented through `.default` alone can still redeem, so records saved before
+  this change keep refreshing. When a refresh does fail with AADSTS70000, the remedy — on
+  `outlook_auth_status`, `outlook-mcp status`, and every tool call — names the code and
+  says to log in again, because the error's own text suggests a retry that cannot work
+  (#82).
+
 ## [1.23.0] — 2026-09-30
 
 The headline is a data-safety fix. Changing a recurring series' start, end or repeat pattern made

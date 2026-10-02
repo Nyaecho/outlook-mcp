@@ -23,6 +23,7 @@ from outlook_mcp.config import Config
 from outlook_mcp.errors import (
     AuthRequiredError,
     ConfigLoadError,
+    StaleConsentError,
     UnencryptedTokenCacheError,
 )
 from outlook_mcp.server import lifespan, outlook_auth_status
@@ -81,6 +82,25 @@ async def test_an_ordinary_unauthenticated_host_is_unchanged():
     assert result["action_required"] == (
         "Run `outlook-mcp auth` on the host to authenticate."
     )
+
+
+@pytest.mark.asyncio
+async def test_auth_status_names_the_70000_dead_end_and_says_log_in_again():
+    """The AADSTS70000 session is unrecoverable; the remedy must say so.
+
+    The generic "run outlook-mcp auth" reads as an optional top-up, and the
+    error's own text suggests a retry that cannot work. The startup error
+    set by the failed refresh has to reach the tool verbatim: code named,
+    exit named.
+    """
+    auth = AuthManager(Config(client_id="x"))
+    auth.startup_error = StaleConsentError()
+
+    result = await outlook_auth_status(_ctx(auth))
+
+    assert result["authenticated"] is False
+    assert "AADSTS70000" in result["action_required"]
+    assert "Log in again" in result["action_required"]
 
 
 # ── A config the server cannot load fails with the fix, never a traceback ──
