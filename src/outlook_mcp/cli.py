@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 
 from azure.core.exceptions import ClientAuthenticationError
@@ -10,6 +11,21 @@ from pydantic import ValidationError
 from outlook_mcp.auth import AuthManager
 from outlook_mcp.config import DEFAULT_CONFIG_DIR, Config, config_repair_lines, load_config
 from outlook_mcp.errors import OutlookMCPError
+
+# The AADSTS65xxx consent refusals (65001 user or admin has not consented,
+# 65004 user declined, 65005 the app asks for permissions the resource never
+# offered) — the one failure class the app registration can actually cause.
+_CONSENT_REFUSAL = re.compile(r"AADSTS65\d{3}")
+
+
+def _is_consent_refusal(exc: BaseException) -> bool:
+    """True for the AADSTS65xxx refusals an app registration can cause.
+
+    Every other refusal — a timed-out device code, a declined sign-in, a
+    generic invalid grant — says nothing about the registration, and the
+    registration remedy would point the operator at the wrong thing.
+    """
+    return _CONSENT_REFUSAL.search(str(exc)) is not None
 
 
 def _load_config_or_exit() -> Config:
@@ -61,18 +77,20 @@ def cmd_auth() -> None:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
     except ClientAuthenticationError as exc:
-        # The sign-in itself was refused. The concrete scopes make this
-        # reachable for a mis-registered app: an app registration missing
-        # one of the delegated permissions asks for fails here and now,
-        # where a .default consent used to "succeed" and strand the session
-        # instead. Azure's text names the code; add the remedy it doesn't.
+        # The sign-in itself was refused. The concrete scopes make a consent
+        # refusal reachable for a mis-registered app: a registration missing
+        # one of the delegated permissions fails here and now, where a
+        # .default consent used to "succeed" and strand the session instead.
+        # Only the AADSTS65xxx refusals say anything about the registration,
+        # so only those get that remedy; Azure's text is printed either way.
         print(f"Sign-in was refused: {exc}", file=sys.stderr)
-        print(
-            "Check that the app registration carries every delegated "
-            "permission the README's registration step lists, then run "
-            "`outlook-mcp auth` again.",
-            file=sys.stderr,
-        )
+        if _is_consent_refusal(exc):
+            print(
+                "Check that the app registration carries every delegated "
+                "permission the README's registration step lists, then run "
+                "`outlook-mcp auth` again.",
+                file=sys.stderr,
+            )
         sys.exit(1)
     print()
     print("Done. The MCP server will use this cached token automatically.")

@@ -162,3 +162,44 @@ def test_auth_refusal_prints_the_remedy_not_a_traceback(capsys, monkeypatch):
     err = capsys.readouterr().err
     assert "Sign-in was refused" in err
     assert "app registration" in err
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        # azure-identity's own device-code timeout text (device_code.py):
+        # no AADSTS code at all.
+        "Timed out waiting for user to authenticate",
+        # A declined sign-in surfaces as access_denied, not a consent-code.
+        "Authentication failed: access_denied: The user has denied access "
+        "to the app",
+        # A generic invalid grant (the AADSTS70000 family) — the code a
+        # stale consent or a revoked refresh token reports.
+        "Authentication failed: AADSTS70000: The requested user must first "
+        "sign-in and grant the client application access",
+    ],
+)
+def test_auth_non_consent_refusals_get_no_registration_remedy(
+    refusal, capsys, monkeypatch
+):
+    """Only the AADSTS65xxx refusals say anything about the app registration.
+
+    A timed-out device code, a declined sign-in and a generic invalid grant
+    are not the registration's fault, so they get the error text alone —
+    blaming the registration there would send the operator re-reading the
+    app setup for a problem their app does not have.
+    """
+    from azure.core.exceptions import ClientAuthenticationError
+
+    monkeypatch.setattr(cli, "load_config", lambda: Config(client_id="test-id"))
+
+    def _refused(self):
+        raise ClientAuthenticationError(refusal)
+
+    monkeypatch.setattr(cli.AuthManager, "login_interactive", _refused)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_auth()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Sign-in was refused" in err
+    assert "app registration" not in err

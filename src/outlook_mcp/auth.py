@@ -105,10 +105,12 @@ def _is_azure_unencrypted_refusal(exc: BaseException) -> bool:
 # A session whose first consent went through .default alone can land with no
 # delegated permissions on it, and redeeming any concrete scope from that
 # session is refused with AADSTS70000 ("The requested user must first sign-in
-# and grant the client application access"). The code embeds itself in the
-# wrapped ClientAuthenticationError text like every MSAL error does, so
-# matching the code on str(exc) is the whole check. The refusal's own wording
-# reads like a retryable blip; the session is unrecoverable, which is why the
+# and grant the client application access"). AADSTS70000 is Entra's generic
+# invalid-grant — a revoked refresh token reports it too — but every case it
+# covers is a dead end for this process with the same exit: a fresh sign-in.
+# The code embeds itself in the wrapped ClientAuthenticationError text like
+# every MSAL error does, so matching the code on str(exc) is the whole check.
+# The refusal's own wording reads like a retryable blip, which is why the
 # remedy says "log in again" in so many words.
 _AADSTS70000_MARKER = "AADSTS70000"
 
@@ -341,9 +343,10 @@ class AuthManager:
                 raise UnencryptedTokenCacheError() from exc
             if _is_consent_dead_end(exc):
                 # Name the dead end rather than offering the generic remedy:
-                # "re-run auth" reads as an optional top-up, but this session
-                # can never grant what is being asked for. Surfaced as the
-                # startup error so auth_status and every tool call carry it.
+                # "re-run auth" reads as an optional top-up, but no refresh
+                # from this process can succeed again — the session cannot
+                # grant what is being asked for. Surfaced as the startup
+                # error so auth_status and every tool call carry it.
                 self.startup_error = StaleConsentError()
                 logger.warning("%s", self.startup_error)
                 return False

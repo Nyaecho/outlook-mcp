@@ -546,6 +546,11 @@ class TestStaleConsentRemedy:
         remedy = str(auth.startup_error)
         assert "AADSTS70000" in remedy
         assert "Log in again" in remedy
+        # AADSTS70000 is Entra's generic invalid-grant — a revoked refresh
+        # token reports it too — so the remedy hedges instead of asserting
+        # the skipped-consent story as the only possibility.
+        assert "most often" in remedy
+        assert "revoked" in remedy
 
     def test_an_ordinary_stale_token_keeps_the_ordinary_remedy(self):
         """An expired token is refreshable — it must not claim the dead end.

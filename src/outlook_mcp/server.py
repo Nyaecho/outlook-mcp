@@ -231,8 +231,8 @@ async def outlook_auth_status(ctx: Context) -> dict:
     }
     if not auth.is_authenticated():
         if auth.startup_error is not None:
-            # Re-running auth would fail identically; say what actually needs
-            # changing.
+            # The refresh already named its own remedy — carry that instead
+            # of the generic line, which reads as "any re-auth will do".
             result["action_required"] = str(auth.startup_error)
         else:
             result["action_required"] = "Run `outlook-mcp auth` on the host to authenticate."
