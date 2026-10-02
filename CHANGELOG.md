@@ -8,6 +8,67 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Four tests no longer fail on every Windows run, and `load_config` stops re-`chmod`ing the
+  config file on every load.** Two separate causes. `os.chmod` on Windows honours only the
+  read-only attribute, so `0o700` and `0o600` are not representable there (measured: `0o777`
+  and `0o666`) and three mode assertions could never pass. Those are now
+  `skipif(sys.platform == "win32")` with the reason in the marker, and the portable halves of two
+  of them — that the directory is created, and that an attachment path stays confined to it —
+  keep running on Windows rather than being skipped along with the mode. The fourth test,
+  `~`-expansion on the attachment-confinement path, was a fixture bug rather than an impossible
+  assertion: `ntpath.expanduser` resolves `~` from `USERPROFILE`, not `HOME`, so patching `HOME`
+  alone had no effect. It now patches both and runs on every platform (#89).
+
+  **Behaviour change.** `load_config` read the config file's mode and re-applied `0o600` when it
+  differed. On Windows the mode never reads back as `0o600`, so that check could never converge
+  and re-`chmod`ed on every single load; it is now skipped where the bits cannot be enforced.
+  One consequence worth naming: a `config.json` the user had marked **read-only** used to have
+  that attribute cleared by any load, because `chmod` on Windows does honour read-only. It now
+  stays read-only, so the lock holds and `save_config` fails rather than silently succeeding
+  after a load has unlocked the file.
+
+  The hardening itself is unchanged, but each site now records what it can and cannot do: on
+  Windows these calls cannot enforce owner-only access, and what governs the path is its Windows
+  ACL — including whatever it inherits from the directory it was created under — which this code
+  neither applies nor verifies. The README's "directory is `0700`, file is `0600`" claim is
+  qualified to match. Applying a real Windows DACL is deliberately not part of this change.
+
+- **A fortnightly series moved to another day keeps each block within one week, even when its
+  pattern omits `firstDayOfWeek`.** When `outlook_update_event` moves a series' days with its start
+  (1.23.0), it moved the week boundary only if the pattern named one. A hand-written pattern
+  repeating every two or more weeks, on several days and with no `firstDayOfWeek`, therefore kept
+  Graph's default Sunday boundary while its days moved. A fortnightly Sunday-and-Monday series
+  moved back a day became Saturday-and-Sunday split across that boundary, and every Sunday landed a
+  week after its Saturday — verified live, reported as `updated`. A missing boundary is now treated
+  as Graph's Sunday and moved with the days. Patterns read back from Graph always carry the field,
+  so only patterns a caller wrote were affected. Every week (`interval` 1) the boundary is now left
+  as it was: it schedules nothing there, and moving it only changed the week start Outlook shows.
+
+- **`config.json` is read and written as UTF-8 on every platform, so a non-ASCII value means the
+  same thing on Windows (#99).** The config was read and written in the locale encoding, which is
+  cp1252 on a typical Windows install. A UTF-8 config, which is what an editor or a copy from
+  another machine produces, was decoded as cp1252 there, so `"attachments_dir": "C:/Users/Zoë/att"`
+  silently became `C:/Users/ZoÃ«/att`: a different directory. A value outside cp1252, such as
+  `中文`, could not be saved at all (`UnicodeEncodeError`). The shared writer now always emits
+  UTF-8, which covers the auth record too. That record is ASCII, so it is unaffected. The reader
+  accepts UTF-8, with or without the byte-order mark that Windows PowerShell 5.1's
+  `Set-Content -Encoding utf8` writes.
+
+  **Behaviour change.** A config the server cannot decode now gets a remedy that names the
+  encoding: "config.json must be saved as UTF-8". Before, it was told to check that the file is
+  readable and owned by you. One case this newly reaches is a UTF-16 file, which is what Windows
+  PowerShell 5.1's `>` and `Out-File` write. On Windows, that file used to be reported as invalid
+  JSON.
+
+  A config saved in the Windows ANSI code page, Windows PowerShell 5.1's `Set-Content` default,
+  loaded correctly before on the machine that wrote it. It keeps loading. When a file is not
+  valid UTF-8, it is read in the machine's own code page as before, but only if the result is a
+  valid config. A warning then asks for a re-save as UTF-8. This is a best-effort fallback for
+  files that are *not* valid UTF-8, with one limit that bytes alone cannot resolve. A legacy file
+  whose bytes also happen to form valid UTF-8 is read as UTF-8, without a warning: the cp1252 bytes
+  for the literal text `ZoÃ«` are UTF-8 for `Zoë`. A UTF-8-only reader would read them identically.
+  Plain accented text such as `Zoë` in cp1252 is not valid UTF-8, so it does reach the fallback.
+
 - **First-time sign-in consents the concrete delegated scopes, not `.default`.** On a
   personal (MSA) account, a first device-code consent asking only for
   `https://graph.microsoft.com/.default` can land a session that authenticates but carries
